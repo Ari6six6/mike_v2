@@ -1,6 +1,7 @@
 """CLI commands, Typer bindings, and the interactive REPL."""
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pathlib
@@ -215,7 +216,8 @@ def cmd_new(name: Optional[str]) -> None:
         return
     proj = create_project(name, path, mode=mode_str)
     if mission:
-        (path / "MISSION.md").write_text(mission + "\n")
+        date_str = datetime.date.today().isoformat()
+        (path / "MISSION.md").write_text(f"## {date_str}\n\n{mission}\n")
         G.console.print(f"[dim]mission saved to MISSION.md[/]")
     set_active_slug(proj.slug)
     append_event("project.activated", {"slug": proj.slug})
@@ -1684,8 +1686,13 @@ def mission_cmd(text: Optional[str] = typer.Argument(None, help="New mission tex
             G.console.print("[dim](no mission set — run: michael mission 'your objective')[/]")
     else:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text.strip() + "\n")
-        G.console.print("[green]mission set[/]")
+        date_str = datetime.date.today().isoformat()
+        entry = f"## {date_str}\n\n{text.strip()}\n"
+        if p.is_file() and p.stat().st_size > 0:
+            p.write_text(p.read_text().rstrip("\n") + "\n\n" + entry)
+        else:
+            p.write_text(entry)
+        G.console.print("[green]mission updated[/]")
 
 
 @app.command(name="config")
