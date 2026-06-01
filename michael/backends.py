@@ -287,28 +287,44 @@ def _vllm_tool_parser(model_repo: str) -> str:
 def _vllm_crash_report(gpu: GpuConfig) -> str:
     """Pull the real root cause out of /tmp/vllm.log after an engine crash.
 
-    vLLM's V1 engine spawns WorkerProc subprocesses whose failures are logged
-    *before* the EngineCore/APIServer wrapper errors. Filtering out the noisy
-    EngineCore/APIServer lines and taking the head of what remains surfaces the
-    actual worker crash (e.g. CUDA OOM, no kernel image). We fall back to the
-    head of all matching lines if the filter leaves nothing, and always append a
-    generous tail of the full log for context.
+    vLLM's V1 engine communicates WorkerProc failures via IPC pipe, not stdout,
+    so the log only contains the generic 'WorkerProc initialization failed'
+    wrapper — the actual GPU/CUDA error is never written to the file. We
+    supplement with:
+      - GPU memory state: total VRAM tells you if OOM is the likely cause
+      - Pre-EngineCore log section: model-load / CUDA errors that occur before
+        the multiprocessing error chain appear here
+      - Worker-process error lines if any do make it into the log
+      - A hint when nothing is found pointing to max_model_len / utilization
     """
     pattern = (
         "error|exception|traceback|runtimeerror|valueerror|assert|"
         "importerror|modulenotfound|out of memory|no kernel image|"
         "not supported|unsupported|compute capability"
     )
-    # Strip EngineCore/APIServer wrapper lines so the head of grep results
-    # shows the WorkerProc crash rather than the generic init-failed chain.
     cmd = (
-        "echo '--- likely root cause ---'; "
+        # GPU memory: total VRAM is the most actionable signal for OOM crashes.
+        "echo '--- GPU memory ---'; "
+        "nvidia-smi --query-gpu=name,memory.total,memory.free,memory.used "
+        "--format=csv,noheader 2>/dev/null || echo '(nvidia-smi unavailable)'; "
+        # Lines before the first (EngineCore pid=…) entry are from the main
+        # process — model loading, CUDA setup, KV-cache sizing errors land here.
+        "echo '--- pre-EngineCore startup output ---'; "
+        "FIRST=$(grep -nm1 '(EngineCore pid=' /tmp/vllm.log 2>/dev/null "
+        "| cut -d: -f1); "
+        'if [ -n "$FIRST" ] && [ "$FIRST" -gt 1 ]; then '
+        "head -$((FIRST - 1)) /tmp/vllm.log 2>/dev/null | tail -50; "
+        "else head -50 /tmp/vllm.log 2>/dev/null; fi; "
+        # Worker-process error lines (if the exception did reach the log).
+        "echo '--- worker-process error lines ---'; "
         f"WORKER=$(grep -niE '{pattern}' /tmp/vllm.log 2>/dev/null "
         r"| grep -vE '\(EngineCore pid=|\(APIServer pid='); "
-        f'if [ -n "$WORKER" ]; then echo "$WORKER" | head -30; '
-        f"else grep -niE '{pattern}' /tmp/vllm.log 2>/dev/null | head -30; fi; "
-        "echo '--- /tmp/vllm.log (last 120 lines) ---'; "
-        "tail -120 /tmp/vllm.log 2>&1"
+        'if [ -n "$WORKER" ]; then echo "$WORKER" | head -30; '
+        "else echo '(none — vLLM did not write the WorkerProc exception to the "
+        "log; GPU memory above is the best clue. If OOM: lower "
+        "gpu.max_model_len or gpu.gpu_memory_utilization in config.json)'; fi; "
+        "echo '--- /tmp/vllm.log (last 60 lines) ---'; "
+        "tail -60 /tmp/vllm.log 2>&1"
     )
     return _gpu_ssh_run(gpu, cmd, timeout=60).stdout.strip()
 
