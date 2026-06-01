@@ -324,10 +324,19 @@ def test_full_toolset_always_available():
 def test_stub_config_has_senior_and_oracle_profiles():
     cfg = m.make_stub_config()
     assert cfg.default_model == "god"
-    # Senior is tool-capable; oracle is the small tool_uncapable text model.
-    assert cfg.models["god"].tool_uncapable is False
-    assert cfg.models["oracle"].tool_uncapable is True
+    # One model, two profiles: senior reasons, oracle is the same model with
+    # reasoning off (a cheap text oracle).
+    assert cfg.models["god"].enable_thinking is True
+    assert cfg.models["oracle"].enable_thinking is False
     assert set(cfg.models) == {"god", "oracle"}
+
+
+def test_default_gpu_is_vllm_hermes_full_precision():
+    from michael.config import GpuConfig
+    g = GpuConfig()
+    assert g.inference_backend == "vllm"
+    assert g.model_repo == "NousResearch/Hermes-4.3-36B"
+    assert g.quantization == ""  # full precision (bf16), no quantization
 
 
 def test_get_model_returns_god_by_default(home):
@@ -374,34 +383,64 @@ def _fake_gpu_ssh(gpu, cmd, *, timeout=60):
     return _FakeCP("ok")
 
 
-def test_ollama_setup_noninteractive_assigns_both_profiles(home, monkeypatch):
-    """The one-shot path issues NO prompts and ends with both profiles pointed
-    at the one shared endpoint, differing only by served_model_name."""
+def test_vllm_setup_points_all_profiles_at_one_model(home, monkeypatch):
+    """Default path: vLLM serves one model; god + oracle (+ analyst) all point at
+    the one endpoint with the same served_model_name, no prompts."""
     from michael import cli
 
     monkeypatch.setattr(cli.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(cli, "_gpu_ssh_run", _fake_gpu_ssh)
     monkeypatch.setattr(
         cli.typer, "prompt",
-        lambda *a, **k: pytest.fail("the ollama one-shot path must not prompt"),
+        lambda *a, **k: pytest.fail("the vllm full-precision path must not prompt"),
+    )
+
+    cfg = m.make_stub_config()        # god + oracle, default backend vllm
+    cfg.gpu.ssh_host = "1.2.3.4"
+    cfg.save()
+
+    endpoint = cli._point_all_profiles_at(
+        cfg, endpoint=f"http://localhost:{cfg.gpu.gpu_port}/v1",
+        served_model_name=cfg.gpu.model_repo,
+    )
+    assert cfg.gpu.model_repo == "NousResearch/Hermes-4.3-36B"
+    for name in ("god", "oracle"):
+        assert cfg.models[name].endpoint == endpoint
+        assert cfg.models[name].served_model_name == "NousResearch/Hermes-4.3-36B"
+    # god reasons, oracle does not — same model, different knob.
+    assert cfg.models["god"].enable_thinking is True
+    assert cfg.models["oracle"].enable_thinking is False
+    loaded = m.Config.load()
+    assert loaded.models["god"].endpoint == loaded.models["oracle"].endpoint == endpoint
+
+
+def test_ollama_optin_assigns_both_profiles(home, monkeypatch):
+    """The Ollama multi-model path is still available when tags are set: both
+    profiles end up on the one shared endpoint, differing by served_model_name."""
+    from michael import cli
+
+    monkeypatch.setattr(cli.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_gpu_ssh_run", _fake_gpu_ssh)
+    monkeypatch.setattr(
+        cli.typer, "prompt",
+        lambda *a, **k: pytest.fail("the ollama path must not prompt"),
     )
 
     cfg = m.make_stub_config()
     cfg.gpu.ssh_host = "1.2.3.4"
     cfg.gpu.inference_backend = "ollama"
+    cfg.gpu.gpu_port = 11434
+    cfg.gpu.ollama_senior_repo = "hermes3:8b-q8_0"
+    cfg.gpu.ollama_oracle_repo = "qwen2.5-coder:3b"
     cfg.save()
 
     cli._run_ollama_setup(cfg, cfg.gpu)
 
     endpoint = f"http://localhost:{cfg.gpu.gpu_port}/v1"
     assert cfg.models["god"].endpoint == endpoint
-    assert cfg.models["god"].served_model_name == cfg.gpu.ollama_senior_repo
+    assert cfg.models["god"].served_model_name == "hermes3:8b-q8_0"
     assert cfg.models["oracle"].endpoint == endpoint
-    assert cfg.models["oracle"].served_model_name == cfg.gpu.ollama_oracle_repo
-    # One endpoint for both — and it survives a round-trip through disk.
-    loaded = m.Config.load()
-    assert loaded.models["god"].endpoint == loaded.models["oracle"].endpoint == endpoint
-    assert loaded.models["oracle"].tool_uncapable is True
+    assert cfg.models["oracle"].served_model_name == "qwen2.5-coder:3b"
 
 
 def test_ollama_protocol_issues_no_prompts_after_ssh(home, monkeypatch, tmp_path):

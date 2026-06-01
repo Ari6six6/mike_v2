@@ -16,7 +16,7 @@ class ModelProfile:
     """One model served behind an OpenAI-compatible endpoint (Ollama)."""
 
     vast_instance_id: str = ""
-    served_model_name: str = ""  # the tag to send in API requests, e.g. "qwen2.5:72b"
+    served_model_name: str = ""  # the model sent in API requests, e.g. "NousResearch/Hermes-4.3-36B"
     request_timeout_s: int = 120
     endpoint: Optional[str] = None
     enable_thinking: bool = False
@@ -57,15 +57,14 @@ class GpuConfig:
     ssh_key_path: str = "~/.ssh/id_ed25519"
     vast_instance_id: str = ""
     gpu_name: str = ""  # hardware name from Vast.ai, e.g. "RTX 4090"
-    model_repo: str = "qwen2.5:72b"  # vLLM: HuggingFace ID. Ollama path uses ollama_senior_repo/ollama_oracle_repo instead.
-    gpu_port: int = 11434
-    inference_backend: str = "ollama"  # "ollama" (default, one-shot multi-model) or "vllm" (interactive, single model)
-    # ── Ollama one-shot: two known-good Q8_0 tags, co-resident on ONE card behind ONE endpoint ──
-    # Senior is tool-capable (drives the agent loop); oracle is a small tool_uncapable text model.
-    # Both are pulled, warmed, and kept HOT (OLLAMA_MAX_LOADED_MODELS=2, OLLAMA_KEEP_ALIVE=-1).
-    ollama_senior_repo: str = "qwen2.5:32b-instruct-q8_0"   # tool-capable senior, ~35 GB at Q8_0
-    ollama_oracle_repo: str = "qwen2.5-coder:7b-instruct-q8_0"  # small oracle, ~8 GB at Q8_0 ("" = senior only)
-    ollama_min_vram_gb: int = 80  # validated co-resident floor (one A100-80G / H100-80G); warn-only if a card is smaller
+    model_repo: str = "NousResearch/Hermes-4.3-36B"  # vLLM: HuggingFace ID. Ollama path uses ollama_senior_repo/ollama_oracle_repo instead.
+    gpu_port: int = 8000
+    inference_backend: str = "vllm"  # "vllm" (default — one model, full precision) or "ollama" (multi-model, GGUF)
+    # ── Ollama multi-model path (optional; empty by default). Two co-resident tags
+    #    behind one port if you set them; otherwise the Ollama path serves model_repo. ──
+    ollama_senior_repo: str = ""   # tool-capable senior Ollama tag (empty = use model_repo)
+    ollama_oracle_repo: str = ""   # small oracle Ollama tag ("" = senior only)
+    ollama_min_vram_gb: int = 0    # optional co-resident VRAM floor for the Ollama path (0 = no check)
     max_model_len: int = 32768  # vLLM --max-model-len; caps KV cache so it fits VRAM (0 = let vLLM decide)
     gpu_memory_utilization: float = 0.92  # vLLM --gpu-memory-utilization (fraction of VRAM for the engine)
     quantization: str = ""  # vLLM --quantization override (e.g. "bitsandbytes", "fp8", "gptq"); "" = auto
@@ -213,22 +212,20 @@ def _diff_from_default(obj: Any, default: Any) -> Any:
 
 
 def make_stub_config() -> Config:
-    """Minimal starting point for the one-shot Ollama flow: the two known-good
-    model profiles the agent loop dispatches to.
+    """Minimal starting point: one model, two profiles onto the same endpoint.
 
-      - ``god``    — tool-capable senior; drives the agent loop.
-      - ``oracle`` — small ``tool_uncapable`` text model (spawn_specialist target).
+      - ``god``    — the senior, reasoning on (``enable_thinking=True``); drives the loop.
+      - ``oracle`` — the same model, reasoning off; a cheap text oracle for spawn_specialist.
 
-    Both are filled with their shared endpoint + served_model_name by
-    ``michael gpu up`` (which pulls the two ``gpu.ollama_*_repo`` tags onto one
-    card behind one port). Every other field uses its dataclass default;
-    save-time pruning keeps the on-disk file to just what the user (or
-    `michael gpu up`) has actually written.
+    ``michael gpu up`` serves one model at full precision (bf16) on one GPU via
+    vLLM and points every profile at that single endpoint. Every other field
+    uses its dataclass default; save-time pruning keeps the on-disk file to just
+    what the user (or `michael gpu up`) has actually written.
     """
     return Config(
         models={
             "god": ModelProfile(enable_thinking=True),
-            "oracle": ModelProfile(tool_uncapable=True),
+            "oracle": ModelProfile(enable_thinking=False),
         },
         default_model="god",
         sandbox=SandboxConfig(passthrough=True),
@@ -244,14 +241,14 @@ CONFIG_HELP: dict[str, str] = {
     "models.god.enable_thinking": "Enable <think> reasoning traces (Hermes 4.3 / QwQ). Recommended for the senior model.",
     "models.god.tool_uncapable": "If true, skip tools/tool_choice params and use text-format tool calling instead (for models without a function-calling template).",
     "models.god.gpu_name": "Which named GPU serves this model (empty = primary gpu). Set to 'junior' for the specialist model.",
-    "models.oracle.served_model_name": "Oracle model tag — set by `michael gpu up` from gpu.ollama_oracle_repo. Shares the senior's endpoint.",
-    "models.oracle.tool_uncapable": "True — the oracle is a small text model with no native function-calling; spawn_specialist calls it as a pure oracle.",
-    "gpu.inference_backend": "Inference backend: 'ollama' (default — one-shot, both models co-resident on one card) or 'vllm' (interactive, single model, true-FP8). Ollama runs end-to-end with no prompts after the SSH handshake.",
-    "gpu.model_repo": "vLLM only: HuggingFace ID e.g. 'NousResearch/Hermes-4.3-36B'. The Ollama path ignores this and uses gpu.ollama_senior_repo / gpu.ollama_oracle_repo.",
-    "gpu.ollama_senior_repo": "Ollama tool-capable senior tag (Q8_0), pulled onto the card and pointed at by the 'god' profile. Default 'qwen2.5:32b-instruct-q8_0' (~35 GB).",
-    "gpu.ollama_oracle_repo": "Ollama small tool_uncapable oracle tag (Q8_0), co-resident with the senior and pointed at by the 'oracle' profile. Default 'qwen2.5-coder:7b-instruct-q8_0' (~8 GB). Empty = load the senior only.",
-    "gpu.ollama_min_vram_gb": "Validated co-resident VRAM floor (default 80 — one A100-80G / H100-80G holds both Q8_0 models with KV headroom). Warn-only: a smaller card still proceeds.",
-    "gpu.gpu_port": "OpenAI-compat port on the GPU (ollama default: 11434, vllm default: 8000 — configurable).",
+    "models.oracle.served_model_name": "Oracle model tag — set by `michael gpu up`. Same model as the senior; shares the one endpoint.",
+    "models.oracle.enable_thinking": "False — the oracle is the same model with reasoning off (a cheap text oracle for spawn_specialist).",
+    "gpu.inference_backend": "Inference backend: 'vllm' (default — one model, full precision bf16 on one GPU) or 'ollama' (multi-model GGUF). No prompts after the SSH handshake when model_repo is set.",
+    "gpu.model_repo": "Model to serve. vLLM: HuggingFace ID (default 'NousResearch/Hermes-4.3-36B', served at full precision). Ollama: a tag, or set gpu.ollama_senior_repo/ollama_oracle_repo for a co-resident pair.",
+    "gpu.ollama_senior_repo": "Optional Ollama senior tag for the Ollama path (empty = use gpu.model_repo).",
+    "gpu.ollama_oracle_repo": "Optional second Ollama tag, co-resident with the senior ('' = senior only).",
+    "gpu.ollama_min_vram_gb": "Optional VRAM floor for the Ollama co-resident path (0 = no check). Warn-only.",
+    "gpu.gpu_port": "OpenAI-compat port on the GPU (vllm default: 8000, ollama default: 11434 — configurable).",
     "gpu.max_model_len": "vLLM only: max context length (--max-model-len). Caps KV cache to fit VRAM. Default 32768; lower it if the engine reports 'KV cache memory' errors at startup, raise it for longer context on bigger GPUs. 0 = let vLLM use the model's full max (often too large for a single GPU).",
     "gpu.gpu_memory_utilization": "vLLM only: fraction of GPU VRAM the engine may use (--gpu-memory-utilization), 0.0–1.0. Default 0.92. Raise toward 0.95 to squeeze in more KV cache, lower if you hit OOM during load.",
     "gpu.nccl_p2p_disable": "vLLM multi-GPU: set true if vLLM crashes immediately at startup with 'WorkerProc initialization failed' on a Vast.ai (or other cloud) multi-GPU instance. Adds NCCL_P2P_DISABLE=1 and NCCL_IB_DISABLE=1, forcing socket-based GPU communication instead of NVLink/InfiniBand — required when GPUs are on separate PCIe buses.",

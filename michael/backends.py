@@ -663,7 +663,7 @@ def _http_error_message(r: httpx.Response, model: str) -> str:
         msg += (
             f"\n\nThe model '{model}' has no tool-calling template, but Michael always "
             "sends tools. Set `gpu.model_repo` to a tool-capable model "
-            "(e.g. qwen2.5:72b, llama3.1:70b) and re-run `michael gpu up`."
+            "(e.g. NousResearch/Hermes-4.3-36B) and re-run `michael gpu up`."
         )
     elif "not found" in low and model and model in detail:
         msg += (

@@ -81,32 +81,20 @@ app = typer.Typer(
 gpu_app = typer.Typer(help="GPU instance management (vLLM or Ollama).", invoke_without_command=True)
 app.add_typer(gpu_app, name="gpu")
 
-SUPPORTED_MODELS = ["qwen2.5:72b", "qwen3:32b", "qwen3:30b-a3b"]
-_MODEL_MIN_DISK_GB: dict[str, int] = {
-    "qwen2.5:72b": 55,
-    "qwen3:32b": 22,
-    "qwen3:30b-a3b": 20,
-    "qwen2.5:32b-instruct-q8_0": 40,       # one-shot senior, Q8_0 ~35 GB on disk
-    "qwen2.5-coder:7b-instruct-q8_0": 12,  # one-shot oracle, Q8_0 ~8 GB on disk
-}
+SUPPORTED_MODELS: list[str] = []  # Ollama menu (opt-in path); no baked-in tags
+_MODEL_MIN_DISK_GB: dict[str, int] = {}
 
 VLLM_SUPPORTED_MODELS = [
-    "deepseek-ai/DeepSeek-V4-Flash",
-    "Qwen/Qwen3-32B-AWQ",
-    "Qwen/Qwen2.5-72B-Instruct-AWQ",
     "NousResearch/Hermes-4.3-36B",
+    "deepseek-ai/DeepSeek-V4-Flash",
 ]
 _VLLM_MODEL_LABELS: dict[str, str] = {
-    "deepseek-ai/DeepSeek-V4-Flash":   "MoE, V4 Flash — 8-bit default, primary target",
-    "Qwen/Qwen3-32B-AWQ":              "dense, 4-bit AWQ, ~20 GB VRAM",
-    "Qwen/Qwen2.5-72B-Instruct-AWQ":   "dense, 4-bit AWQ, ~40 GB VRAM",
-    "NousResearch/Hermes-4.3-36B":     "36B instruct, native tool-calling, ChatML — ~72 GB bf16 / ~36 GB INT8 (bitsandbytes)",
+    "NousResearch/Hermes-4.3-36B":     "36B (Seed-OSS base), hybrid <think>, native tool-calling — full precision bf16 ~72 GB, one 80 GB+ card",
+    "deepseek-ai/DeepSeek-V4-Flash":   "MoE, V4 Flash",
 }
 _VLLM_MODEL_MIN_DISK_GB: dict[str, int] = {
-    "deepseek-ai/DeepSeek-V4-Flash":   30,
-    "Qwen/Qwen3-32B-AWQ":              25,
-    "Qwen/Qwen2.5-72B-Instruct-AWQ":   45,
     "NousResearch/Hermes-4.3-36B":     75,
+    "deepseek-ai/DeepSeek-V4-Flash":   30,
 }
 
 tools_app = typer.Typer(help="Inspect and run dynamic tools.")
@@ -168,7 +156,7 @@ def cmd_init() -> None:
         Panel(
             "Edit ~/.michael/config.json — fill in:\n\n"
             "  [bold]vast_api_key[/]              your Vast.ai console API key\n"
-            "  [bold]gpu.model_repo[/]            Ollama tag, e.g. 'qwen2.5:72b'\n\n"
+            "  [bold]gpu.model_repo[/]            HF model id (default 'NousResearch/Hermes-4.3-36B')\n\n"
             "[dim]Optional, for remote sandbox on the VPS:[/]\n"
             "  [bold]vps.host[/]                  VPS public IP/hostname\n"
             "  [bold]vps.user[/]                  ssh user (default: michael)\n"
@@ -291,12 +279,8 @@ def _prompt_model_selection(
         hint = "HuggingFace model ID, e.g. mistralai/Mistral-7B-Instruct-v0.3"
     else:
         builtin = list(SUPPORTED_MODELS)
-        labels = {
-            "qwen2.5:72b":   "large instruct, ~45 GB VRAM",
-            "qwen3:32b":     "dense, ~20 GB VRAM",
-            "qwen3:30b-a3b": "MoE, ~18 GB VRAM, more KV cache headroom",
-        }
-        hint = "Ollama tag, e.g. llama3.1:70b"
+        labels: dict[str, str] = {}
+        hint = "Ollama tag, e.g. hermes3:8b-q8_0"
 
     # merge built-ins + saved custom (dedup, preserve order)
     all_models: list[str] = list(builtin)
@@ -721,6 +705,31 @@ def _ollama_warm_model(gpu: "GpuConfig", tag: str) -> None:
         )
 
 
+def _point_all_profiles_at(cfg: "Config", *, endpoint: str, served_model_name: str) -> str:
+    """Point every model profile at one endpoint serving one model.
+
+    Used by the single-model path (vLLM full precision): god, oracle, analyst —
+    every profile resolves to the same endpoint and the same served_model_name.
+    Profiles still differ by their own knobs (enable_thinking, slim_context).
+    Missing 'god'/'oracle' profiles are created. Returns the endpoint.
+    """
+    from michael.config import ModelProfile
+
+    senior_name = cfg.default_model or "god"
+    if senior_name not in cfg.models:
+        cfg.models[senior_name] = ModelProfile(enable_thinking=True)
+    cfg.default_model = senior_name
+    if "oracle" not in cfg.models:
+        cfg.models["oracle"] = ModelProfile(enable_thinking=False)
+
+    for prof in cfg.models.values():
+        prof.endpoint = endpoint
+        prof.served_model_name = served_model_name
+        prof.gpu_name = ""  # single shared GPU
+    cfg.save()
+    return endpoint
+
+
 def _assign_ollama_profiles(
     cfg: "Config", gpu: "GpuConfig", senior_tag: str, oracle_tag: str
 ) -> str:
@@ -1096,20 +1105,9 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
             f"vLLM server did not become ready within {_max_wait_s}s\n{diag.strip()}"
         )
 
-    # ── Save endpoint ──
-    endpoint = f"http://localhost:{gpu.gpu_port}/v1"
-    if not profile_name:
-        profile_name = cfg.default_model or "god"
-    if profile_name not in cfg.models:
-        from michael.config import ModelProfile
-        cfg.models[profile_name] = ModelProfile()
-        if not cfg.default_model:
-            cfg.default_model = profile_name
-    cfg.models[profile_name].endpoint = endpoint
-    cfg.models[profile_name].served_model_name = gpu.model_repo
-    if profile_name not in ("god", ""):
-        cfg.models[profile_name].gpu_name = profile_name
-    cfg.save()
+    # ── Save endpoint — one model, every profile points at it ──
+    endpoint = _point_all_profiles_at(cfg, endpoint=f"http://localhost:{gpu.gpu_port}/v1",
+                                      served_model_name=gpu.model_repo)
     append_event("gpu.ready", {"host": gpu.ssh_host, "model": gpu.model_repo, "endpoint": endpoint, "backend": "vllm"})
 
     pf_cmd = gpu_port_forward_cmd(gpu)
@@ -1169,55 +1167,31 @@ def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig", profile_name: str =
             f"  3. If that works, run `michael gpu` again."
         )
 
-    # ── Backend is config-driven, and Ollama is the one-shot default. On the
-    #    Ollama path the two model tags are already KNOWN (gpu.ollama_senior_repo
-    #    / gpu.ollama_oracle_repo), so NOTHING is asked after the SSH handshake.
-    #    The vLLM path stays fully interactive (backend / model / quantization
-    #    prompts) — it serves a single model and is opt-in via
-    #    gpu.inference_backend="vllm". ──
-    if gpu.inference_backend == "vllm":
-        # Detect what's installed, to default the chooser sensibly.
+    # ── One model, one GPU, no prompts. The model is pinned in config
+    #    (gpu.model_repo, default NousResearch/Hermes-4.3-36B) and served at full
+    #    precision (bf16) via vLLM — quantization stays whatever config says
+    #    (default ""=bf16). The interactive backend/model menus only appear if no
+    #    model is pinned (a deliberately blanked config), so the normal path and
+    #    every re-run run end-to-end with zero questions after the SSH handshake. ──
+    if not gpu.model_repo:
         cp_ollama = _gpu_ssh_run(gpu, "command -v ollama >/dev/null 2>&1 && echo yes || echo no", timeout=30)
         cp_vllm = _gpu_ssh_run(
             gpu, _GPU_PY + '"$PY" -c "import vllm" 2>/dev/null && echo yes || echo no', timeout=30
         )
         has_ollama = "yes" in cp_ollama.stdout
         has_vllm = "yes" in cp_vllm.stdout
-        default_backend = "vllm"
-        if has_ollama and not has_vllm:
-            default_backend = "ollama"
+        default_backend = gpu.inference_backend or ("ollama" if (has_ollama and not has_vllm) else "vllm")
         gpu.inference_backend = _prompt_backend_selection(default_backend)
+        if gpu.inference_backend == "vllm":
+            custom = gpu.custom_vllm_models
+            gpu.model_repo = _prompt_model_selection(gpu.model_repo, backend="vllm", custom_models=custom)
+            gpu.custom_vllm_models = custom
 
     if gpu.inference_backend == "vllm":
-        custom = gpu.custom_vllm_models
-        gpu.model_repo = _prompt_model_selection(
-            gpu.model_repo, backend="vllm", custom_models=custom
-        )
-        gpu.custom_vllm_models = custom
-
-        # ── Quantization (vLLM only, non-AWQ models) ──
-        if "awq" not in gpu.model_repo.lower():
-            _quant_options = ["", "bitsandbytes", "fp8", "gptq"]
-            _quant_labels = {
-                "": "auto (bf16/fp16 — full precision, no override)",
-                "bitsandbytes": "INT8 on-the-fly — halves VRAM, works on any Ampere+ GPU",
-                "fp8": "FP8 on-the-fly — ~halves VRAM, Ampere+ only (faster than bnb)",
-                "gptq": "GPTQ (requires a pre-quantized checkpoint on HuggingFace)",
-            }
-            G.console.print("\n[bold]Quantization:[/]")
-            for i, q in enumerate(_quant_options, 1):
-                marker = " [green]← current[/]" if q == (getattr(gpu, "quantization", "") or "") else ""
-                G.console.print(f"  [cyan]{i}.[/] {q or 'auto'}  [dim]({_quant_labels[q]})[/]{marker}")
-            cur_q = getattr(gpu, "quantization", "") or ""
-            default_q = str(_quant_options.index(cur_q) + 1) if cur_q in _quant_options else "1"
-            raw_q = typer.prompt("Quantization", default=default_q).strip()
-            try:
-                qi = int(raw_q)
-                if 1 <= qi <= len(_quant_options):
-                    gpu.quantization = _quant_options[qi - 1]
-            except ValueError:
-                if raw_q in _quant_options:
-                    gpu.quantization = raw_q
+        prec = f"quantized ({gpu.quantization})" if (getattr(gpu, "quantization", "") or "") else "full precision (bf16)"
+        G.console.print(f"[dim]vLLM · {gpu.model_repo} · {prec} · one GPU — no prompts[/]")
+    else:
+        G.console.print(f"[dim]ollama · {gpu.ollama_senior_repo or gpu.model_repo} — no prompts[/]")
 
     # Single shared GPU — always cfg.gpu (named-GPU machinery removed).
     cfg.gpu = gpu
