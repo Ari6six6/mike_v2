@@ -1,4 +1,5 @@
 """CLI commands, Typer bindings, and the interactive REPL."""
+import datetime
 import json
 import os
 import pathlib
@@ -33,6 +34,7 @@ from michael.backends import (
     _ssh_argv,
     _ssh_preflight,
     _GPU_PY,
+    _gpu_compute_cap,
     _gpu_vllm_overrides,
     _vllm_crash_report,
     _start_ollama_cmd,
@@ -92,7 +94,7 @@ _VLLM_MODEL_LABELS: dict[str, str] = {
     "deepseek-ai/DeepSeek-V4-Flash":   "MoE, V4 Flash — 8-bit default, primary target",
     "Qwen/Qwen3-32B-AWQ":              "dense, 4-bit AWQ, ~20 GB VRAM",
     "Qwen/Qwen2.5-72B-Instruct-AWQ":   "dense, 4-bit AWQ, ~40 GB VRAM",
-    "NousResearch/Hermes-4.3-36B":     "36B instruct, native tool-calling, ChatML — ~72 GB VRAM bf16",
+    "NousResearch/Hermes-4.3-36B":     "36B instruct, native tool-calling, ChatML — ~72 GB bf16 / ~36 GB INT8 (bitsandbytes)",
 }
 _VLLM_MODEL_MIN_DISK_GB: dict[str, int] = {
     "deepseek-ai/DeepSeek-V4-Flash":   30,
@@ -213,7 +215,8 @@ def cmd_new(name: Optional[str]) -> None:
         return
     proj = create_project(name, path, mode=mode_str)
     if mission:
-        (path / "MISSION.md").write_text(mission + "\n")
+        date_str = datetime.date.today().isoformat()
+        (path / "MISSION.md").write_text(f"## {date_str}\n\n{mission}\n")
         G.console.print(f"[dim]mission saved to MISSION.md[/]")
     set_active_slug(proj.slug)
     append_event("project.activated", {"slug": proj.slug})
@@ -842,7 +845,17 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
     # overrides vLLM won't pick on its own: --dtype half (no bfloat16) and, for
     # AWQ checkpoints, --quantization awq (the auto-selected awq_marlin kernel
     # needs sm80+). Without these the engine dies at init.
-    dtype, quant = _gpu_vllm_overrides(gpu)
+    # Pascal and older (compute < 7.0, e.g. Tesla P40 = 6.1) are not supported
+    # by vLLM v1 at all — its CUDA kernels require Volta (sm70+).
+    _cap = _gpu_compute_cap(gpu)
+    if 0 < _cap < 7.0:
+        raise G.MichaelError(
+            f"GPU compute capability {_cap:.1f} (Pascal or older) is not supported by vLLM v1,\n"
+            f"which requires Volta or newer (sm70 / compute 7.0+).\n\n"
+            f"Rerun `michael gpu up` and select backend 2 (ollama) — it bundles its own\n"
+            f"CUDA runtime and works on older GPUs like the Tesla P40."
+        )
+    dtype, quant = _gpu_vllm_overrides(gpu, _cap)
     if dtype or quant:
         extras = " ".join(
             f"--{k} {v}" for k, v in (("dtype", dtype), ("quantization", quant)) if v
@@ -1031,6 +1044,31 @@ def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig", profile_name: str =
         gpu.custom_vllm_models = custom
     else:
         gpu.custom_ollama_models = custom
+
+    # ── Quantization (vLLM only, non-AWQ models) ──
+    if gpu.inference_backend == "vllm" and "awq" not in gpu.model_repo.lower():
+        _quant_options = ["", "bitsandbytes", "fp8", "gptq"]
+        _quant_labels = {
+            "": "auto (bf16/fp16 — full precision, no override)",
+            "bitsandbytes": "INT8 on-the-fly — halves VRAM, works on any Ampere+ GPU",
+            "fp8": "FP8 on-the-fly — ~halves VRAM, Ampere+ only (faster than bnb)",
+            "gptq": "GPTQ (requires a pre-quantized checkpoint on HuggingFace)",
+        }
+        G.console.print("\n[bold]Quantization:[/]")
+        for i, q in enumerate(_quant_options, 1):
+            marker = " [green]← current[/]" if q == (getattr(gpu, "quantization", "") or "") else ""
+            G.console.print(f"  [cyan]{i}.[/] {q or 'auto'}  [dim]({_quant_labels[q]})[/]{marker}")
+        cur_q = getattr(gpu, "quantization", "") or ""
+        default_q = str(_quant_options.index(cur_q) + 1) if cur_q in _quant_options else "1"
+        raw_q = typer.prompt("Quantization", default=default_q).strip()
+        try:
+            qi = int(raw_q)
+            if 1 <= qi <= len(_quant_options):
+                gpu.quantization = _quant_options[qi - 1]
+        except ValueError:
+            if raw_q in _quant_options:
+                gpu.quantization = raw_q
+
     cfg.gpu = gpu
     cfg.save()
 
@@ -1682,8 +1720,13 @@ def mission_cmd(text: Optional[str] = typer.Argument(None, help="New mission tex
             G.console.print("[dim](no mission set — run: michael mission 'your objective')[/]")
     else:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text.strip() + "\n")
-        G.console.print("[green]mission set[/]")
+        date_str = datetime.date.today().isoformat()
+        entry = f"## {date_str}\n\n{text.strip()}\n"
+        if p.is_file() and p.stat().st_size > 0:
+            p.write_text(p.read_text().rstrip("\n") + "\n\n" + entry)
+        else:
+            p.write_text(entry)
+        G.console.print("[green]mission updated[/]")
 
 
 @app.command(name="config")

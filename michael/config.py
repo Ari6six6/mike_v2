@@ -62,6 +62,7 @@ class GpuConfig:
     inference_backend: str = "vllm"  # "vllm" or "ollama" — auto-detected on gpu up
     max_model_len: int = 32768  # vLLM --max-model-len; caps KV cache so it fits VRAM (0 = let vLLM decide)
     gpu_memory_utilization: float = 0.92  # vLLM --gpu-memory-utilization (fraction of VRAM for the engine)
+    quantization: str = ""  # vLLM --quantization override (e.g. "bitsandbytes", "fp8", "gptq"); "" = auto
     custom_vllm_models: list = field(default_factory=list)   # user-added HuggingFace model IDs
     custom_ollama_models: list = field(default_factory=list)  # user-added Ollama tags
 

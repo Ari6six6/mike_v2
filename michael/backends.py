@@ -233,7 +233,7 @@ def _gpu_compute_cap(gpu: GpuConfig) -> float:
         return 0.0
 
 
-def _gpu_vllm_overrides(gpu: GpuConfig) -> tuple[Optional[str], Optional[str]]:
+def _gpu_vllm_overrides(gpu: GpuConfig, cap: float = 0.0) -> tuple[Optional[str], Optional[str]]:
     """Return (dtype, quantization) launch overrides for this GPU + model.
 
     Pre-Ampere cards (compute capability < 8.0, e.g. Titan RTX / Turing) need
@@ -247,11 +247,15 @@ def _gpu_vllm_overrides(gpu: GpuConfig) -> tuple[Optional[str], Optional[str]]:
       fast. The plain `awq` kernel works on sm75.
 
     On Ampere+ we return (None, None) and let vLLM decide.
+    An explicit `gpu.quantization` (e.g. "bitsandbytes", "fp8") always wins over
+    auto-detection so the user can force INT8/fp8 on any card.
     """
-    cap = _gpu_compute_cap(gpu)
+    if not cap:
+        cap = _gpu_compute_cap(gpu)
+    explicit_quant = getattr(gpu, "quantization", "") or ""
     if not (0 < cap < 8.0):
-        return None, None
-    quant = "awq" if "awq" in gpu.model_repo.lower() else None
+        return None, explicit_quant or None
+    quant = explicit_quant or ("awq" if "awq" in gpu.model_repo.lower() else None)
     return "half", quant
 
 

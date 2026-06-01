@@ -82,6 +82,15 @@ def spawn_specialist(model_name: str, prompt: str, **_: Any) -> str:
     if not profile.served_model_name:
         return f"error: models.{model_name}.served_model_name is not set."
 
+    gpu_key = profile.gpu_name or model_name
+    gpu = cfg.get_gpu(gpu_key)
+    if gpu and gpu.ssh_host:
+        from michael.backends import _ensure_tunnel
+        try:
+            _ensure_tunnel(gpu_key, gpu)
+        except Exception as exc:
+            return f"error: tunnel for '{gpu_key}' failed to come up: {exc}"
+
     client = LLMClient(profile.endpoint)
     try:
         resp = client.chat.completions.create(
