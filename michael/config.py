@@ -63,6 +63,7 @@ class GpuConfig:
     max_model_len: int = 32768  # vLLM --max-model-len; caps KV cache so it fits VRAM (0 = let vLLM decide)
     gpu_memory_utilization: float = 0.92  # vLLM --gpu-memory-utilization (fraction of VRAM for the engine)
     quantization: str = ""  # vLLM --quantization override (e.g. "bitsandbytes", "fp8", "gptq"); "" = auto
+    nccl_p2p_disable: bool = False  # set True on Vast.ai multi-GPU if NCCL fails to init (adds NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1)
     custom_vllm_models: list = field(default_factory=list)   # user-added HuggingFace model IDs
     custom_ollama_models: list = field(default_factory=list)  # user-added Ollama tags
 
@@ -235,6 +236,7 @@ CONFIG_HELP: dict[str, str] = {
     "gpus.<name>.gpu_port": "Local port for the secondary GPU tunnel (must differ from primary, e.g. 11435).",
     "gpu.max_model_len": "vLLM only: max context length (--max-model-len). Caps KV cache to fit VRAM. Default 32768; lower it if the engine reports 'KV cache memory' errors at startup, raise it for longer context on bigger GPUs. 0 = let vLLM use the model's full max (often too large for a single GPU).",
     "gpu.gpu_memory_utilization": "vLLM only: fraction of GPU VRAM the engine may use (--gpu-memory-utilization), 0.0–1.0. Default 0.92. Raise toward 0.95 to squeeze in more KV cache, lower if you hit OOM during load.",
+    "gpu.nccl_p2p_disable": "vLLM multi-GPU: set true if vLLM crashes immediately at startup with 'WorkerProc initialization failed' on a Vast.ai (or other cloud) multi-GPU instance. Adds NCCL_P2P_DISABLE=1 and NCCL_IB_DISABLE=1, forcing socket-based GPU communication instead of NVLink/InfiniBand — required when GPUs are on separate PCIe buses.",
     "vps.host": "VPS public IP/hostname (empty = no remote sandbox).",
     "vps.user": "SSH user (default: michael).",
     "vps.ssh_key_path": "Path to private key (default: ~/.ssh/id_ed25519).",
