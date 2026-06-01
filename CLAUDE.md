@@ -20,11 +20,23 @@ Phone (Termux / Linux)          VPS (Ubuntu 24.04, rootless podman)
 ```
 
 **Named model profiles:**
-Multiple model profiles can coexist in `config.json` under `models.<name>`. The default
-profile is `god` (auto-created by `michael init`). Additional profiles (e.g. `hermes`) can
-be added manually and selected per-run with `michael run --model hermes <prompt>` or made
-the default by setting `default_model`. `michael gpu up` fills in the `endpoint` and
-`served_model_name` for whichever profile is active at setup time.
+Multiple model profiles can coexist in `config.json` under `models.<name>`. `michael init`
+auto-creates two: `god` (the tool-capable senior, default) and `oracle` (a small
+`tool_uncapable` text model). Additional profiles can be added manually and selected
+per-run with `michael run --model <name> <prompt>` or made the default by setting
+`default_model`. All profiles share **one** GPU and **one** endpoint — they differ only by
+`served_model_name`. `michael gpu up` fills in `endpoint` and `served_model_name` for every
+profile at once.
+
+**One GPU, both models hot (Ollama, default):**
+`michael gpu up` is a one-shot, non-interactive command. The *only* manual step is the SSH
+handshake to the rented Vast.ai box (you paste its SSH command). Everything after that is
+automated: install Ollama, pull **both** known-good Q8_0 models, and load them co-resident
+on a single card behind a single port (`OLLAMA_MAX_LOADED_MODELS=2`, `OLLAMA_KEEP_ALIVE=-1`
+keep both hot). The two tags come from config (`gpu.ollama_senior_repo`,
+`gpu.ollama_oracle_repo`) — no model/quant/backend prompts. The interactive flow
+(backend → model → quantization) and the single-model setup remain available on the vLLM
+path via `gpu.inference_backend="vllm"` (kept intact for true-FP8 work later).
 
 **Four-header context package** (sent on every fresh LLM instance):
 - H1 — user's prompts verbatim, in order
@@ -65,7 +77,7 @@ bash bootstrap_termux.sh          # Termux
 
 # Initialise config
 michael init
-michael config                    # fill in vast_api_key, optionally gpu.model_repo
+michael config                    # fill in vast_api_key (Ollama tags are baked in by default)
 ```
 
 ### 2. VPS (sandbox, run once as root)
@@ -85,15 +97,27 @@ michael ssh-test                  # verify roundtrip
 
 ### 3. Vast.ai GPU
 
-1. Rent an instance — any GPU with enough VRAM for your chosen model (default
-   `qwen2.5:72b` needs ~45 GB). Any PyTorch / CUDA template works; no on-start
-   command needed.
-2. Optionally set `gpu.model_repo` in `~/.michael/config.json` if you want a
-   model other than the default `qwen2.5:72b`. Any Ollama tag works
-   (`llama3.1:70b`, `qwen2.5-coder:32b`, etc.).
-3. Start inference: `michael gpu up`. On first run it prompts for the Vast SSH
-   command, installs Ollama (one curl line), pulls the model, and caches the
-   endpoint. Subsequent runs reuse the cached config.
+**Validated known-good Ollama combo (baked default):** two models co-resident on one card
+at 8-bit (Q8_0):
+
+| Role | Profile | Ollama tag (Q8_0) | ~Weights |
+|------|---------|-------------------|----------|
+| Senior (tool-capable) | `god` | `qwen2.5:32b-instruct-q8_0` | ~35 GB |
+| Oracle (`tool_uncapable`) | `oracle` | `qwen2.5-coder:7b-instruct-q8_0` | ~8 GB |
+
+**Co-resident VRAM floor: 80 GB** — a single A100-80G or H100-80G holds both with KV
+headroom. (An L40S-48G works only with reduced context; drop `gpu.ollama_senior_repo` /
+`gpu.ollama_oracle_repo` to smaller tags. The floor is warned-not-failed, so smaller cards
+still proceed.)
+
+1. Rent an instance — any single GPU at/above the floor (A100-80G / H100), or whatever's
+   available. Any PyTorch / CUDA template works; no on-start command needed.
+2. Optionally override `gpu.ollama_senior_repo` / `gpu.ollama_oracle_repo` in
+   `~/.michael/config.json` for a different pair of Ollama tags.
+3. Start inference: `michael gpu up`. **The one manual step is pasting the Vast SSH
+   command.** Everything after is automated and reported step-by-step: install Ollama, pull
+   both tags, warm both into VRAM (kept hot), and point both profiles at the one shared
+   endpoint. No model/quant/backend prompts. Idempotent — re-run after fixing any error.
 
 ### 4. First run
 
@@ -112,19 +136,19 @@ The LLM reads your code, iterates, calls `commit_changes` when done. Done.
 |-----|-------------|
 | `vast_api_key` | Vast.ai console API key |
 | `default_model` | Profile to use (default: `god`). Override per-run with `--model <name>` |
-| `gpu.model_repo` | vLLM: HuggingFace ID e.g. `NousResearch/Hermes-4.3-36B`; Ollama: tag e.g. `qwen2.5:72b` |
+| `gpu.inference_backend` | `ollama` (default — one-shot, both models co-resident) or `vllm` (interactive, single model, true-FP8) |
+| `gpu.ollama_senior_repo` | Ollama tool-capable senior tag, Q8_0 (default `qwen2.5:32b-instruct-q8_0`). Pulled + pointed at by the `god` profile |
+| `gpu.ollama_oracle_repo` | Ollama small `tool_uncapable` oracle tag, Q8_0 (default `qwen2.5-coder:7b-instruct-q8_0`). Co-resident, pointed at by `oracle`. Empty = senior only |
+| `gpu.ollama_min_vram_gb` | Validated co-resident VRAM floor (default `80`). Warn-only: a smaller card still proceeds |
+| `gpu.model_repo` | vLLM only: HuggingFace ID e.g. `NousResearch/Hermes-4.3-36B`. The Ollama path ignores this and uses `gpu.ollama_*_repo` |
 | `gpu.gpu_port` | OpenAI-compat port on the GPU (ollama default `11434`, vLLM default `8000`) |
 | `gpu.max_model_len` | vLLM only: max context length (`--max-model-len`). Caps KV cache to fit VRAM (default `32768`). Lower it if startup fails with a "KV cache memory" error; `0` lets vLLM use the model's full native max (often too large for one GPU) |
 | `gpu.gpu_memory_utilization` | vLLM only: fraction of GPU VRAM the engine may use (`--gpu-memory-utilization`, default `0.92`). Raise toward `0.95` for more KV cache, lower on load-time OOM |
 | `models.<name>.request_timeout_s` | LLM request timeout in seconds |
-| `models.<name>.served_model_name` | Auto-filled by `gpu up` from `gpu.model_repo` |
-| `models.<name>.gpu_name` | Named GPU that serves this model (empty = primary `gpu`). Set by `michael gpu up <name>`. |
-| `models.<name>.enable_thinking` | Enable `<think>` reasoning traces — set `true` for Hermes 4.3 on the senior model. |
-| `models.<name>.tool_uncapable` | Set `true` for base-model fine-tunes with no native function-calling (e.g. the junior specialist). |
-| `gpus.<name>.ssh_host` | SSH host for a named GPU instance. Set by `michael gpu up <name>`. |
-| `gpus.<name>.gpu_port` | Local tunnel port for the named GPU — must be unique (e.g. god=11434, junior=11435). |
-| `gpus.<name>.model_repo` | HuggingFace ID (vLLM) or Ollama tag for the named GPU. |
-| `gpus.<name>.inference_backend` | `vllm` or `ollama` — auto-detected on `gpu up`. |
+| `models.<name>.served_model_name` | The tag sent in API requests. Auto-filled by `gpu up` (senior ← `ollama_senior_repo`, oracle ← `ollama_oracle_repo`) |
+| `models.<name>.enable_thinking` | Enable `<think>` reasoning traces — set `true` on the tool-capable senior. |
+| `models.<name>.tool_uncapable` | Set `true` for base-model fine-tunes with no native function-calling (the `oracle` profile). |
+| `models.<name>.gpu_name` | Legacy/back-compat only — every profile now resolves to the one shared GPU; this no longer selects a tunnel. |
 | `vps.host` | VPS public IP/hostname (empty = no remote sandbox) |
 | `vps.user` | SSH user (default: `michael`) |
 | `vps.ssh_key_path` | Path to private key (default: `~/.ssh/id_ed25519`) |
@@ -151,9 +175,9 @@ The LLM reads your code, iterates, calls `commit_changes` when done. Done.
 | `michael use <slug>` | Switch active project |
 | `michael current` | Print active project |
 | `michael config` | Open `config.json` in `$EDITOR` |
-| `michael gpu up [name]` | Provision GPU (default: `god`). `michael gpu up junior` provisions a second GPU on its own SSH tunnel and port. |
+| `michael gpu up` | One-shot bring-up of the shared GPU: paste the SSH command, then it installs the backend and loads both Ollama models hot on one endpoint — no further prompts. |
 | `michael gpu new` | Swap to a new GPU — clear cached SSH/instance state, re-prompt, then `gpu up` |
-| `michael gpu down [name]` | Pause the GPU instance (default: `god`) |
+| `michael gpu down` | Stop the inference server and pause the Vast.ai instance |
 | `michael status` | Derived state from event log |
 | `michael run <prompt…>` | **Run the agent.** Everything after `run` is the prompt |
 | `michael log [--tail N]` | Show event log (last 20 by default) |

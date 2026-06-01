@@ -171,10 +171,16 @@ def _start_ollama_cmd(gpu: GpuConfig) -> str:
     short sleep — that's done in a separate SSH call so SSH session timing
     can't affect the verification.
     """
+    # OLLAMA_MAX_LOADED_MODELS=2 + OLLAMA_KEEP_ALIVE=-1 keep BOTH the senior and
+    # the oracle resident in VRAM at once, behind this one port — the senior and
+    # oracle differ only by served_model_name, never by endpoint. Without these,
+    # Ollama evicts the idle model after a few minutes and the second request
+    # pays a cold reload.
     return (
         "pkill -x ollama 2>/dev/null; "
         "touch /tmp/ollama.log; "
         f"OLLAMA_HOST=0.0.0.0:{gpu.gpu_port} "
+        "OLLAMA_MAX_LOADED_MODELS=2 OLLAMA_KEEP_ALIVE=-1 "
         "nohup ollama serve >/tmp/ollama.log 2>&1 </dev/null & "
         "echo $!"
     )
