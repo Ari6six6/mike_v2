@@ -45,6 +45,9 @@ import michael.globals as G
 # Instance management:
 #   instance.start_requested, instance.started, instance.stop_requested, instance.stopped
 #   instance.poll — periodic polling of Vast.ai instance status
+#
+# Router:
+#   route.decided — router selected a profile (task, chosen_profile, rule_matched)
 
 
 # ---------------------------------------------------------------------------

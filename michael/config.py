@@ -83,6 +83,7 @@ class Config:
     boot_poll_s: int = 10
     scripture_dir: str = "scripture"
     workbench_root: str = "~/workbench"
+    router_enabled: bool = False
 
     @classmethod
     def load(cls) -> "Config":
@@ -252,4 +253,9 @@ CONFIG_HELP: dict[str, str] = {
     "log_responses": "If true, log full LLM responses to events.jsonl.",
     "boot_poll_s": "Poll interval while waiting for the inference server to come up.",
     "scripture_dir": "Path to scripture files (relative to repo root, default 'scripture').",
+    "router_enabled": (
+        "If true, the route_task tool is active and will automatically select a specialist "
+        "model profile based on the task description. Default false — senior calls "
+        "spawn_specialist manually with an explicit model_name."
+    ),
 }
