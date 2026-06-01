@@ -408,12 +408,20 @@ def _tool_body_section() -> str:
     return "\n".join(lines)
 
 
-def _load_mission(project: "Project") -> str:
+def _load_mission(project: "Project", max_chars: int = 8000) -> str:
     p = pathlib.Path(project.path) / "MISSION.md"
     if not p.is_file():
         return ""
     try:
-        return p.read_text(errors="replace").strip()
+        full = p.read_text(errors="replace").strip()
+        if len(full) <= max_chars:
+            return full
+        # Keep the most recent sections (tail) when the file grows large
+        tail = full[-max_chars:]
+        cut = tail.find("\n## ")
+        if cut != -1:
+            tail = tail[cut + 1:]
+        return f"[... earlier entries truncated — {len(full) - len(tail)} chars omitted ...]\n\n{tail}"
     except OSError:
         return ""
 

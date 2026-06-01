@@ -1069,7 +1069,10 @@ def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig", profile_name: str =
             if raw_q in _quant_options:
                 gpu.quantization = raw_q
 
-    cfg.gpu = gpu
+    if profile_name and profile_name not in ("god", ""):
+        cfg.gpus[profile_name] = gpu
+    else:
+        cfg.gpu = gpu
     cfg.save()
 
     # ── Dispatch to backend-specific setup ──
@@ -1274,10 +1277,10 @@ def cmd_status() -> None:
     G.console.print(table)
 
 
-def cmd_run(prompt: str) -> None:
+def cmd_run(prompt: str, model_override: Optional[str] = None) -> None:
     project = require_active_project()
     cfg = Config.load()
-    name, profile = cfg.get_model()
+    name, profile = cfg.get_model(model_override)
     _run_agent_loop(project, cfg, name, profile, prompt, verb_label="run")
 
 
@@ -1719,11 +1722,16 @@ def mission_cmd(text: Optional[str] = typer.Argument(None, help="New mission tex
         else:
             G.console.print("[dim](no mission set — run: michael mission 'your objective')[/]")
     else:
+        stripped = text.strip()
+        if not stripped:
+            G.console.print("[yellow]mission text is empty — nothing saved[/]")
+            return
         p.parent.mkdir(parents=True, exist_ok=True)
         date_str = datetime.date.today().isoformat()
-        entry = f"## {date_str}\n\n{text.strip()}\n"
-        if p.is_file() and p.stat().st_size > 0:
-            p.write_text(p.read_text().rstrip("\n") + "\n\n" + entry)
+        entry = f"## {date_str}\n\n{stripped}\n"
+        existing = p.read_text() if p.is_file() else ""
+        if existing.strip():
+            p.write_text(existing.rstrip("\n") + "\n\n" + entry)
         else:
             p.write_text(entry)
         G.console.print("[green]mission updated[/]")
@@ -1735,7 +1743,7 @@ def config_cmd() -> None:
     cmd_config()
 
 
-@gpu_app.callback(invoke_without_command=True)
+@gpu_app.callback()
 def gpu_callback(ctx: typer.Context) -> None:
     """Pick which Vast.ai GPU to use. Shows your instances with hardware names; saves the selection."""
     if ctx.invoked_subcommand is None:
@@ -1780,17 +1788,19 @@ def status_cmd() -> None:
 
 @app.command(name="run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run_cmd(
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model profile to use (e.g. 'junior'). Defaults to config's default_model."),
     prompt: list[str] = typer.Argument(None, help="Prompt — every word after 'run' is the prompt."),
 ) -> None:
     """Run the agent on a prompt. Everything after 'run' is the prompt.
 
     Example: michael run fix the auth bug in login.py
+    Example: michael run --model junior draft the exploit
     """
     text = " ".join(prompt or []).strip()
     if not text:
         G.err.print("michael run requires a prompt. Example: michael run fix the login bug")
         raise typer.Exit(1)
-    cmd_run(text)
+    cmd_run(text, model_override=model)
 
 
 @app.command(name="ask", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

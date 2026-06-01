@@ -404,7 +404,7 @@ def _run_agent_loop(
                     )
                     break
                 except Exception as _conn_exc:
-                    if _attempt == 0 and _is_conn_refused(_conn_exc) and _gpu.ssh_host:
+                    if _is_conn_refused(_conn_exc) and _gpu.ssh_host:
                         G.console.print("[yellow]LLM connection lost — reconnecting tunnel...[/]")
                         _close_tunnel(profile.gpu_name or "god")
                         _ensure_tunnel(profile.gpu_name or "god", _gpu)
@@ -452,8 +452,10 @@ def _run_agent_loop(
                 G.console.print(f"[dim]· tool {tc.name}[/]")
                 try:
                     targs = json.loads(tc.arguments or "{}")
-                except json.JSONDecodeError:
-                    targs = {}
+                except json.JSONDecodeError as _je:
+                    result = f"[tool call error] {tc.name}: malformed JSON arguments — {_je}. Re-emit with valid JSON."
+                    messages.append({"role": "tool", "tool_call_id": tc.id or "", "content": result})
+                    continue
                 if tc.name in ("write_file", "apply_patch") and "path" in targs:
                     G.console.print(f"[dim]  → {targs['path']}[/]")
                 result = dispatch_tool_call(
