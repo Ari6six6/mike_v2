@@ -81,26 +81,20 @@ app = typer.Typer(
 gpu_app = typer.Typer(help="GPU instance management (vLLM or Ollama).", invoke_without_command=True)
 app.add_typer(gpu_app, name="gpu")
 
-SUPPORTED_MODELS = ["qwen2.5:72b", "qwen3:32b", "qwen3:30b-a3b"]
-_MODEL_MIN_DISK_GB: dict[str, int] = {"qwen2.5:72b": 55, "qwen3:32b": 22, "qwen3:30b-a3b": 20}
+SUPPORTED_MODELS: list[str] = []  # Ollama menu (opt-in path); no baked-in tags
+_MODEL_MIN_DISK_GB: dict[str, int] = {}
 
 VLLM_SUPPORTED_MODELS = [
-    "deepseek-ai/DeepSeek-V4-Flash",
-    "Qwen/Qwen3-32B-AWQ",
-    "Qwen/Qwen2.5-72B-Instruct-AWQ",
     "NousResearch/Hermes-4.3-36B",
+    "deepseek-ai/DeepSeek-V4-Flash",
 ]
 _VLLM_MODEL_LABELS: dict[str, str] = {
-    "deepseek-ai/DeepSeek-V4-Flash":   "MoE, V4 Flash — 8-bit default, primary target",
-    "Qwen/Qwen3-32B-AWQ":              "dense, 4-bit AWQ, ~20 GB VRAM",
-    "Qwen/Qwen2.5-72B-Instruct-AWQ":   "dense, 4-bit AWQ, ~40 GB VRAM",
-    "NousResearch/Hermes-4.3-36B":     "36B instruct, native tool-calling, ChatML — ~72 GB bf16 / ~36 GB INT8 (bitsandbytes)",
+    "NousResearch/Hermes-4.3-36B":     "36B (Seed-OSS base), hybrid <think>, native tool-calling — full precision bf16 ~72 GB, one 80 GB+ card",
+    "deepseek-ai/DeepSeek-V4-Flash":   "MoE, V4 Flash",
 }
 _VLLM_MODEL_MIN_DISK_GB: dict[str, int] = {
-    "deepseek-ai/DeepSeek-V4-Flash":   30,
-    "Qwen/Qwen3-32B-AWQ":              25,
-    "Qwen/Qwen2.5-72B-Instruct-AWQ":   45,
     "NousResearch/Hermes-4.3-36B":     75,
+    "deepseek-ai/DeepSeek-V4-Flash":   30,
 }
 
 tools_app = typer.Typer(help="Inspect and run dynamic tools.")
@@ -162,7 +156,7 @@ def cmd_init() -> None:
         Panel(
             "Edit ~/.michael/config.json — fill in:\n\n"
             "  [bold]vast_api_key[/]              your Vast.ai console API key\n"
-            "  [bold]gpu.model_repo[/]            Ollama tag, e.g. 'qwen2.5:72b'\n\n"
+            "  [bold]gpu.model_repo[/]            HF model id (default 'NousResearch/Hermes-4.3-36B')\n\n"
             "[dim]Optional, for remote sandbox on the VPS:[/]\n"
             "  [bold]vps.host[/]                  VPS public IP/hostname\n"
             "  [bold]vps.user[/]                  ssh user (default: michael)\n"
@@ -285,12 +279,8 @@ def _prompt_model_selection(
         hint = "HuggingFace model ID, e.g. mistralai/Mistral-7B-Instruct-v0.3"
     else:
         builtin = list(SUPPORTED_MODELS)
-        labels = {
-            "qwen2.5:72b":   "large instruct, ~45 GB VRAM",
-            "qwen3:32b":     "dense, ~20 GB VRAM",
-            "qwen3:30b-a3b": "MoE, ~18 GB VRAM, more KV cache headroom",
-        }
-        hint = "Ollama tag, e.g. llama3.1:70b"
+        labels: dict[str, str] = {}
+        hint = "Ollama tag, e.g. hermes3:8b-q8_0"
 
     # merge built-ins + saved custom (dedup, preserve order)
     all_models: list[str] = list(builtin)
@@ -589,8 +579,220 @@ def _reconnect_ssh_only(cfg: "Config", gpu: "GpuConfig") -> None:
     cfg.save()
 
 
+def _ollama_models_to_load(gpu: "GpuConfig") -> "list[str]":
+    """The known-good tags to pull/warm, in load order: senior first, then oracle.
+
+    Both come from config (no prompting). The oracle is optional — an empty
+    ``ollama_oracle_repo`` (or one equal to the senior) collapses to a single
+    co-resident model. ``model_repo`` is honoured as a legacy fallback for the
+    senior so pre-existing single-model Ollama configs keep working.
+    """
+    senior = getattr(gpu, "ollama_senior_repo", "") or gpu.model_repo
+    oracle = getattr(gpu, "ollama_oracle_repo", "")
+    tags = [senior]
+    if oracle and oracle != senior:
+        tags.append(oracle)
+    return tags
+
+
+def _ollama_max_card_vram_gb(gpu: "GpuConfig") -> int:
+    """Largest single-card VRAM in GB (0 if nvidia-smi is unavailable).
+
+    Co-residency needs ONE card big enough for both models, so we take the max
+    per-card total rather than the sum across cards.
+    """
+    cp = _gpu_ssh_run(
+        gpu,
+        "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null",
+        timeout=30,
+    )
+    best = 0
+    for line in cp.stdout.splitlines():
+        v = line.strip()
+        if v.isdigit():
+            best = max(best, int(v) // 1024)  # MiB → GB
+    return best
+
+
+def _ollama_ensure_model(cfg: "Config", gpu: "GpuConfig", tag: str) -> None:
+    """Pull one Ollama tag if not already present, reporting progress as events.
+
+    Idempotent: a tag already on the card is skipped. Disk is preflighted
+    against ``_MODEL_MIN_DISK_GB`` so an out-of-space card fails with an
+    actionable message instead of a half-written blob.
+    """
+    cp = _gpu_ssh_run(
+        gpu,
+        f"ollama list 2>/dev/null | awk 'NR>1 {{print $1}}' | grep -Fxq {tag!r} "
+        f"&& echo present || echo missing",
+        timeout=60,
+    )
+    if "present" in cp.stdout:
+        G.console.print(f"[dim]model {tag} already present[/]")
+        return
+
+    disk_kb = _gpu_ssh_run(gpu, "df / | awk 'NR==2{print $4}'", timeout=60).stdout.strip()
+    min_gb = _MODEL_MIN_DISK_GB.get(tag, 30)
+    if disk_kb.isdigit() and int(disk_kb) < min_gb * 1_000_000:
+        avail_gb = int(disk_kb) // 1_000_000
+        raise G.MichaelError(
+            f"Not enough disk space to pull {tag} "
+            f"(only ~{avail_gb} GB free, need ~{min_gb} GB). Free space and retry:\n"
+            f"  ssh -p {gpu.ssh_port} {gpu.ssh_user}@{gpu.ssh_host} "
+            f"'rm -rf /root/.ollama/models/ && df -h /'"
+        )
+    G.console.print(f"[cyan]Pulling model {tag} (this can take a while)…[/]")
+    _gpu_ssh_run(
+        gpu,
+        "rm -f /tmp/ollama_pull.exit && "
+        "( nohup bash -c "
+        f"'ollama pull {tag} > /tmp/ollama_pull.log 2>&1; "
+        "echo $? > /tmp/ollama_pull.exit' "
+        "> /dev/null 2>&1 < /dev/null & ) && echo started",
+        timeout=60,
+    )
+    _max_pull_s = 3600
+    _poll_s = 15
+    _elapsed = 0
+    while _elapsed < _max_pull_s:
+        time.sleep(_poll_s)
+        _elapsed += _poll_s
+        cp = _gpu_ssh_run(
+            gpu, "cat /tmp/ollama_pull.exit 2>/dev/null || echo running", timeout=180
+        )
+        done = cp.stdout.strip()
+        if done and done != "running":
+            rc = int(done) if done.lstrip("-").isdigit() else 1
+            if rc != 0:
+                tail = _gpu_ssh_run(
+                    gpu, "tail -30 /tmp/ollama_pull.log 2>/dev/null", timeout=60
+                ).stdout
+                raise G.MichaelError(f"ollama pull of {tag} failed (rc={rc}):\n{tail.strip()}")
+            G.console.print(f"[green]model {tag} pulled[/]")
+            return
+        tail = _ANSI.sub("", _gpu_ssh_run(
+            gpu, "tail -1 /tmp/ollama_pull.log 2>/dev/null", timeout=180
+        ).stdout.strip().replace("\r", " "))
+        G.console.print(
+            f"[dim]· {tag} {_elapsed}s — {(tail[:110] + '…') if len(tail) > 110 else (tail or 'starting pull…')}[/]"
+        )
+        append_event("gpu.poll", {"elapsed_s": _elapsed, "phase": "pull", "model": tag})
+    raise G.MichaelError(
+        f"ollama pull of {tag} did not finish within {_max_pull_s}s. "
+        "SSH in and tail /tmp/ollama_pull.log for the real status."
+    )
+
+
+def _ollama_warm_model(gpu: "GpuConfig", tag: str) -> None:
+    """Preload a tag into VRAM with an indefinite keep-alive so it stays HOT.
+
+    Best-effort: a model that fails to warm here will still load on the first
+    real request, so we report the failure but do not abort the whole bring-up.
+    """
+    cp = _gpu_ssh_run(
+        gpu,
+        f"curl -sf http://localhost:{gpu.gpu_port}/api/generate "
+        f"-d '{{\"model\":\"{tag}\",\"prompt\":\"\",\"stream\":false,\"keep_alive\":-1}}' "
+        f">/dev/null 2>&1 && echo warmed || echo warm_failed",
+        timeout=600,
+    )
+    if "warmed" in cp.stdout:
+        G.console.print(f"[green]model {tag} loaded into VRAM (kept hot)[/]")
+    else:
+        G.console.print(
+            f"[yellow]could not preload {tag} (will load on first request): "
+            f"{cp.stderr.strip()[:120] or cp.stdout.strip()[:120]}[/]"
+        )
+
+
+def _point_all_profiles_at(cfg: "Config", *, endpoint: str, served_model_name: str) -> str:
+    """Point every model profile at one endpoint serving one model.
+
+    Used by the single-model path (vLLM full precision): god, oracle, analyst —
+    every profile resolves to the same endpoint and the same served_model_name.
+    Profiles still differ by their own knobs (enable_thinking, slim_context).
+    Missing 'god'/'oracle' profiles are created. Returns the endpoint.
+    """
+    from michael.config import ModelProfile
+
+    senior_name = cfg.default_model or "god"
+    if senior_name not in cfg.models:
+        cfg.models[senior_name] = ModelProfile(enable_thinking=True)
+    cfg.default_model = senior_name
+    if "oracle" not in cfg.models:
+        cfg.models["oracle"] = ModelProfile(enable_thinking=False)
+
+    for prof in cfg.models.values():
+        prof.endpoint = endpoint
+        prof.served_model_name = served_model_name
+        prof.gpu_name = ""  # single shared GPU
+    cfg.save()
+    return endpoint
+
+
+def _assign_ollama_profiles(
+    cfg: "Config", gpu: "GpuConfig", senior_tag: str, oracle_tag: str
+) -> str:
+    """Point every model profile at the one shared Ollama endpoint.
+
+    The senior ('god' / default_model) and the oracle (the tool_uncapable
+    profile, created as 'oracle' if absent) differ ONLY by served_model_name —
+    both share this endpoint, this tunnel, this port. The analyst profile, if
+    present, is repointed at the same endpoint so it rides the senior's warm GPU
+    with no second instance. Returns the endpoint.
+    """
+    from michael.config import ModelProfile
+
+    endpoint = f"http://localhost:{gpu.gpu_port}/v1"
+
+    senior_name = cfg.default_model or "god"
+    senior = cfg.models.setdefault(senior_name, ModelProfile(enable_thinking=True))
+    senior.endpoint = endpoint
+    senior.served_model_name = senior_tag
+    senior.gpu_name = ""  # single shared GPU — no named-GPU tunnel selection
+    if not cfg.default_model:
+        cfg.default_model = senior_name
+
+    if oracle_tag:
+        # Reuse an existing tool_uncapable profile if there is one; else 'oracle'.
+        oracle_name = next(
+            (n for n, p in cfg.models.items() if p.tool_uncapable and n != senior_name),
+            "oracle",
+        )
+        oracle = cfg.models.setdefault(oracle_name, ModelProfile(tool_uncapable=True))
+        oracle.endpoint = endpoint
+        oracle.served_model_name = oracle_tag
+        oracle.tool_uncapable = True
+        oracle.gpu_name = ""
+
+    analyst = cfg.models.get("analyst")
+    if analyst is not None:
+        analyst.endpoint = endpoint
+        analyst.gpu_name = ""
+
+    cfg.save()
+    return endpoint
+
+
 def _run_ollama_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> None:
-    """Install ollama, start daemon, pull model, save endpoint, print port-forward."""
+    """One-shot, non-interactive Ollama bring-up.
+
+    Everything here runs without a single prompt — the two model tags are read
+    from config (``gpu.ollama_senior_repo`` / ``gpu.ollama_oracle_repo``). The
+    only human step is the SSH handshake, which has already happened upstream in
+    ``_run_gpu_setup_protocol``. Steps (each reported to the console + event
+    log): install ollama → start the daemon with both-models-hot env → pull both
+    tags → warm both into VRAM → point both profiles at the one shared endpoint.
+    """
+    tags = _ollama_models_to_load(gpu)
+    senior_tag = tags[0]
+    oracle_tag = tags[1] if len(tags) > 1 else ""
+    G.console.print(
+        f"[bold]ollama one-shot[/] — senior [cyan]{senior_tag}[/]"
+        + (f" + oracle [cyan]{oracle_tag}[/]" if oracle_tag else " (senior only)")
+        + " · co-resident on one card, one endpoint"
+    )
+
     # ── Install ollama if missing ──
     cp = _gpu_ssh_run(gpu, "command -v ollama >/dev/null && echo installed || echo missing")
     if "missing" in cp.stdout:
@@ -686,87 +888,46 @@ def _run_ollama_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -
             f"ollama daemon did not become ready within {_max_wait_s}s\n{diag.strip()}"
         )
 
-    # ── Pull the model if not already present ──
-    cp = _gpu_ssh_run(
-        gpu,
-        f"ollama list 2>/dev/null | awk 'NR>1 {{print $1}}' | grep -Fxq {gpu.model_repo!r} "
-        f"&& echo present || echo missing",
-        timeout=60,
-    )
-    if "missing" in cp.stdout:
-        disk_kb = _gpu_ssh_run(gpu, "df / | awk 'NR==2{print $4}'", timeout=60).stdout.strip()
-        min_gb = _MODEL_MIN_DISK_GB.get(gpu.model_repo, 30)
-        if disk_kb.isdigit() and int(disk_kb) < min_gb * 1_000_000:
-            avail_gb = int(disk_kb) // 1_000_000
-            raise G.MichaelError(
-                f"Not enough disk space to pull {gpu.model_repo} "
-                f"(only ~{avail_gb} GB free, need ~{min_gb} GB). Free space and retry:\n"
-                f"  ssh -p {gpu.ssh_port} {gpu.ssh_user}@{gpu.ssh_host} "
-                f"'rm -rf /root/.ollama/models/ && df -h /'"
-            )
-        G.console.print(f"[cyan]Pulling model {gpu.model_repo} (this can take a while)…[/]")
-        _gpu_ssh_run(
-            gpu,
-            "rm -f /tmp/ollama_pull.exit && "
-            "( nohup bash -c "
-            f"'ollama pull {gpu.model_repo} > /tmp/ollama_pull.log 2>&1; "
-            "echo $? > /tmp/ollama_pull.exit' "
-            "> /dev/null 2>&1 < /dev/null & ) && echo started",
-            timeout=60,
-        )
-        _max_pull_s = 3600
-        _poll_s = 15
-        _elapsed = 0
-        while _elapsed < _max_pull_s:
-            time.sleep(_poll_s)
-            _elapsed += _poll_s
-            cp = _gpu_ssh_run(
-                gpu, "cat /tmp/ollama_pull.exit 2>/dev/null || echo running", timeout=180
-            )
-            done = cp.stdout.strip()
-            if done and done != "running":
-                rc = int(done) if done.lstrip("-").isdigit() else 1
-                if rc != 0:
-                    tail = _gpu_ssh_run(
-                        gpu, "tail -30 /tmp/ollama_pull.log 2>/dev/null", timeout=60
-                    ).stdout
-                    raise G.MichaelError(f"ollama pull failed (rc={rc}):\n{tail.strip()}")
-                G.console.print(f"[green]model {gpu.model_repo} pulled[/]")
-                break
-            tail = _ANSI.sub("", _gpu_ssh_run(
-                gpu, "tail -1 /tmp/ollama_pull.log 2>/dev/null", timeout=180
-            ).stdout.strip().replace("\r", " "))
+    # ── VRAM floor (warn-only): co-residency needs one card big enough for both ──
+    floor = getattr(gpu, "ollama_min_vram_gb", 0) or 0
+    if floor:
+        card_gb = _ollama_max_card_vram_gb(gpu)
+        if card_gb and card_gb < floor:
             G.console.print(
-                f"[dim]· {_elapsed}s — {(tail[:120] + '…') if len(tail) > 120 else (tail or 'starting pull…')}[/]"
+                f"[yellow]warning: largest GPU is ~{card_gb} GB, below the validated "
+                f"{floor} GB floor for {senior_tag}"
+                + (f" + {oracle_tag}" if oracle_tag else "")
+                + " at Q8_0.[/]\n[yellow]Proceeding anyway — if a model fails to load "
+                "(OOM), drop gpu.ollama_senior_repo/ollama_oracle_repo to smaller tags "
+                "and re-run `michael gpu up`.[/]"
             )
-            append_event("gpu.poll", {"elapsed_s": _elapsed, "phase": "pull"})
-        else:
-            raise G.MichaelError(
-                f"ollama pull did not finish within {_max_pull_s}s. "
-                "SSH in and tail /tmp/ollama_pull.log for the real status."
-            )
+        elif card_gb:
+            G.console.print(f"[dim]largest GPU ~{card_gb} GB ≥ {floor} GB floor[/]")
 
-    # ── Save endpoint ──
-    endpoint = f"http://localhost:{gpu.gpu_port}/v1"
-    if not profile_name:
-        profile_name = cfg.default_model or "god"
-    if profile_name not in cfg.models:
-        from michael.config import ModelProfile
-        cfg.models[profile_name] = ModelProfile()
-        if not cfg.default_model:
-            cfg.default_model = profile_name
-    cfg.models[profile_name].endpoint = endpoint
-    cfg.models[profile_name].served_model_name = gpu.model_repo
-    if profile_name not in ("god", ""):
-        cfg.models[profile_name].gpu_name = profile_name
-    cfg.save()
-    append_event("gpu.ready", {"host": gpu.ssh_host, "model": gpu.model_repo, "endpoint": endpoint})
+    # ── Pull both tags (idempotent), then warm both into VRAM ──
+    for tag in tags:
+        _ollama_ensure_model(cfg, gpu, tag)
+    for tag in tags:
+        _ollama_warm_model(gpu, tag)
+
+    # Report co-residency from the server's own view.
+    ps = _gpu_ssh_run(gpu, "ollama ps 2>/dev/null", timeout=60).stdout.strip()
+    if ps:
+        G.console.print(f"[dim]ollama ps:\n{ps}[/]")
+
+    # ── Point every profile at the one shared endpoint ──
+    endpoint = _assign_ollama_profiles(cfg, gpu, senior_tag, oracle_tag)
+    append_event(
+        "gpu.ready",
+        {"host": gpu.ssh_host, "models": tags, "endpoint": endpoint, "backend": "ollama"},
+    )
 
     pf_cmd = gpu_port_forward_cmd(gpu)
-    gpu_label = f" ({gpu.gpu_name})" if gpu.gpu_name else ""
+    model_lines = f"  senior : {senior_tag}\n" + (f"  oracle : {oracle_tag}\n" if oracle_tag else "")
     G.console.print(
         Panel(
-            f"[bold green]ollama is ready[/]{gpu_label} — {gpu.model_repo}\n\n"
+            f"[bold green]ollama is ready[/] — both models co-resident on one endpoint\n\n"
+            f"{model_lines}\n"
             f"[bold]Open a new terminal and run:[/]\n\n"
             f"  {pf_cmd}\n\n"
             f"[dim]Keep that terminal open. Then use:[/]\n"
@@ -944,20 +1105,9 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
             f"vLLM server did not become ready within {_max_wait_s}s\n{diag.strip()}"
         )
 
-    # ── Save endpoint ──
-    endpoint = f"http://localhost:{gpu.gpu_port}/v1"
-    if not profile_name:
-        profile_name = cfg.default_model or "god"
-    if profile_name not in cfg.models:
-        from michael.config import ModelProfile
-        cfg.models[profile_name] = ModelProfile()
-        if not cfg.default_model:
-            cfg.default_model = profile_name
-    cfg.models[profile_name].endpoint = endpoint
-    cfg.models[profile_name].served_model_name = gpu.model_repo
-    if profile_name not in ("god", ""):
-        cfg.models[profile_name].gpu_name = profile_name
-    cfg.save()
+    # ── Save endpoint — one model, every profile points at it ──
+    endpoint = _point_all_profiles_at(cfg, endpoint=f"http://localhost:{gpu.gpu_port}/v1",
+                                      served_model_name=gpu.model_repo)
     append_event("gpu.ready", {"host": gpu.ssh_host, "model": gpu.model_repo, "endpoint": endpoint, "backend": "vllm"})
 
     pf_cmd = gpu_port_forward_cmd(gpu)
@@ -1017,62 +1167,34 @@ def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig", profile_name: str =
             f"  3. If that works, run `michael gpu` again."
         )
 
-    # ── Detect what's installed, to default the chooser sensibly ──
-    cp_ollama = _gpu_ssh_run(gpu, "command -v ollama >/dev/null 2>&1 && echo yes || echo no", timeout=30)
-    cp_vllm = _gpu_ssh_run(
-        gpu, _GPU_PY + '"$PY" -c "import vllm" 2>/dev/null && echo yes || echo no', timeout=30
-    )
-    has_ollama = "yes" in cp_ollama.stdout
-    has_vllm = "yes" in cp_vllm.stdout
+    # ── One model, one GPU, no prompts. The model is pinned in config
+    #    (gpu.model_repo, default NousResearch/Hermes-4.3-36B) and served at full
+    #    precision (bf16) via vLLM — quantization stays whatever config says
+    #    (default ""=bf16). The interactive backend/model menus only appear if no
+    #    model is pinned (a deliberately blanked config), so the normal path and
+    #    every re-run run end-to-end with zero questions after the SSH handshake. ──
+    if not gpu.model_repo:
+        cp_ollama = _gpu_ssh_run(gpu, "command -v ollama >/dev/null 2>&1 && echo yes || echo no", timeout=30)
+        cp_vllm = _gpu_ssh_run(
+            gpu, _GPU_PY + '"$PY" -c "import vllm" 2>/dev/null && echo yes || echo no', timeout=30
+        )
+        has_ollama = "yes" in cp_ollama.stdout
+        has_vllm = "yes" in cp_vllm.stdout
+        default_backend = gpu.inference_backend or ("ollama" if (has_ollama and not has_vllm) else "vllm")
+        gpu.inference_backend = _prompt_backend_selection(default_backend)
+        if gpu.inference_backend == "vllm":
+            custom = gpu.custom_vllm_models
+            gpu.model_repo = _prompt_model_selection(gpu.model_repo, backend="vllm", custom_models=custom)
+            gpu.custom_vllm_models = custom
 
-    default_backend = gpu.inference_backend
-    if has_ollama and not has_vllm:
-        default_backend = "ollama"
-    elif has_vllm and not has_ollama:
-        default_backend = "vllm"
-
-    # ── Pick the gear (authoritative) and the model, now that SSH is up ──
-    gpu.inference_backend = _prompt_backend_selection(default_backend)
-    custom = (
-        gpu.custom_vllm_models if gpu.inference_backend == "vllm" else gpu.custom_ollama_models
-    )
-    gpu.model_repo = _prompt_model_selection(
-        gpu.model_repo, backend=gpu.inference_backend, custom_models=custom
-    )
-    # write back the (possibly extended) custom list
     if gpu.inference_backend == "vllm":
-        gpu.custom_vllm_models = custom
+        prec = f"quantized ({gpu.quantization})" if (getattr(gpu, "quantization", "") or "") else "full precision (bf16)"
+        G.console.print(f"[dim]vLLM · {gpu.model_repo} · {prec} · one GPU — no prompts[/]")
     else:
-        gpu.custom_ollama_models = custom
+        G.console.print(f"[dim]ollama · {gpu.ollama_senior_repo or gpu.model_repo} — no prompts[/]")
 
-    # ── Quantization (vLLM only, non-AWQ models) ──
-    if gpu.inference_backend == "vllm" and "awq" not in gpu.model_repo.lower():
-        _quant_options = ["", "bitsandbytes", "fp8", "gptq"]
-        _quant_labels = {
-            "": "auto (bf16/fp16 — full precision, no override)",
-            "bitsandbytes": "INT8 on-the-fly — halves VRAM, works on any Ampere+ GPU",
-            "fp8": "FP8 on-the-fly — ~halves VRAM, Ampere+ only (faster than bnb)",
-            "gptq": "GPTQ (requires a pre-quantized checkpoint on HuggingFace)",
-        }
-        G.console.print("\n[bold]Quantization:[/]")
-        for i, q in enumerate(_quant_options, 1):
-            marker = " [green]← current[/]" if q == (getattr(gpu, "quantization", "") or "") else ""
-            G.console.print(f"  [cyan]{i}.[/] {q or 'auto'}  [dim]({_quant_labels[q]})[/]{marker}")
-        cur_q = getattr(gpu, "quantization", "") or ""
-        default_q = str(_quant_options.index(cur_q) + 1) if cur_q in _quant_options else "1"
-        raw_q = typer.prompt("Quantization", default=default_q).strip()
-        try:
-            qi = int(raw_q)
-            if 1 <= qi <= len(_quant_options):
-                gpu.quantization = _quant_options[qi - 1]
-        except ValueError:
-            if raw_q in _quant_options:
-                gpu.quantization = raw_q
-
-    if profile_name and profile_name not in ("god", ""):
-        cfg.gpus[profile_name] = gpu
-    else:
-        cfg.gpu = gpu
+    # Single shared GPU — always cfg.gpu (named-GPU machinery removed).
+    cfg.gpu = gpu
     cfg.save()
 
     # ── Dispatch to backend-specific setup ──
@@ -1101,36 +1223,35 @@ def cmd_gpu() -> None:
 
 
 def cmd_gpu_up(gpu_name: str = "god") -> None:
-    """Start the selected GPU: resume instance, auto-detect backend, install if needed, start server."""
-    cfg = Config.load()
+    """Start the one shared GPU: resume instance, install backend if needed, serve.
 
-    if gpu_name == "god":
-        # Primary GPU — existing path, touches cfg.gpu
+    Michael runs a single GPU serving every model behind one endpoint, so the
+    legacy ``gpu_name`` argument is accepted only for CLI compatibility — any
+    value resolves to the primary ``cfg.gpu``.
+    """
+    cfg = Config.load()
+    if gpu_name not in ("", "god"):
+        G.console.print(
+            f"[dim]named GPUs were collapsed into one shared GPU — '{gpu_name}' "
+            f"maps to the primary GPU.[/]"
+        )
+
+    gpu = cfg.gpu
+    if not gpu.ssh_host and not gpu.vast_instance_id:
+        cmd_gpu()
+        cfg = Config.load()
         gpu = cfg.gpu
-        if not gpu.ssh_host and not gpu.vast_instance_id:
-            cmd_gpu()
-            cfg = Config.load()
-            gpu = cfg.gpu
-        if gpu.vast_instance_id:
-            _resume_known_instance(cfg, gpu)
-        else:
-            G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
-            cp = _gpu_ssh_run(gpu, "echo ok", timeout=60)
-            if cp.returncode != 0:
-                raise G.MichaelError(
-                    f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
-                    "Check ssh_key_path in config or try ssh manually."
-                )
-        _run_gpu_setup_protocol(cfg, gpu)
+    if gpu.vast_instance_id:
+        _resume_known_instance(cfg, gpu)
     else:
-        # Named secondary GPU — stored in cfg.gpus[gpu_name]
-        from michael.config import GpuConfig as _GpuConfig
-        gpu = cfg.gpus.get(gpu_name, _GpuConfig())
-        G.console.print(f"[bold]Setting up GPU {gpu_name!r}[/] — provide the Vast.ai SSH command or host details.")
-        _manual_ssh_setup(cfg, gpu)
-        cfg.gpus[gpu_name] = gpu
-        cfg.save()
-        _run_gpu_setup_protocol(cfg, gpu, profile_name=gpu_name)
+        G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
+        cp = _gpu_ssh_run(gpu, "echo ok", timeout=60)
+        if cp.returncode != 0:
+            raise G.MichaelError(
+                f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
+                "Check ssh_key_path in config or try ssh manually."
+            )
+    _run_gpu_setup_protocol(cfg, gpu)
 
 
 def _clear_gpu_known_hosts() -> None:
@@ -1171,9 +1292,9 @@ def cmd_gpu_new() -> None:
 
 def cmd_gpu_down(gpu_name: str = "god") -> None:
     cfg = Config.load()
-    gpu = cfg.get_gpu(gpu_name)
+    gpu = cfg.gpu  # single shared GPU — gpu_name kept only for CLI compatibility
     if not gpu.ssh_host:
-        raise G.MichaelError(f"no GPU {gpu_name!r} configured — run `michael gpu up {gpu_name}` first")
+        raise G.MichaelError("no GPU configured — run `michael gpu up` first")
 
     # Stop inference server via SSH (best-effort — instance may already be off)
     if gpu.inference_backend == "vllm":
@@ -1200,10 +1321,9 @@ def cmd_gpu_down(gpu_name: str = "god") -> None:
         G.console.print("[dim]no vast_instance_id or vast_api_key — skipping API stop[/]")
         append_event("gpu.stopped", {"host": gpu.ssh_host})
 
-    # Clear endpoint for all profiles that use this GPU
-    for pname, prof in cfg.models.items():
-        if (gpu_name == "god" and not prof.gpu_name) or prof.gpu_name == gpu_name:
-            prof.endpoint = None
+    # One GPU serves every profile — clear them all.
+    for prof in cfg.models.values():
+        prof.endpoint = None
     cfg.save()
 
 
@@ -1752,9 +1872,12 @@ def gpu_callback(ctx: typer.Context) -> None:
 
 @gpu_app.command("up")
 def gpu_up_cmd(
-    name: str = typer.Argument("god", help="GPU profile name (default: god). Use 'junior' for the specialist GPU."),
+    name: str = typer.Argument("god", help="Accepted for compatibility; one shared GPU serves every model."),
 ) -> None:
-    """Start a named GPU. `michael gpu up` starts the primary (god) GPU; `michael gpu up junior` provisions a second instance."""
+    """One-shot bring-up of the shared GPU: after the SSH handshake, install the
+    backend and load both Ollama models (senior + oracle) hot on one endpoint —
+    no further prompts. Set gpu.inference_backend='vllm' for the interactive,
+    single-model vLLM path."""
     cmd_gpu_up(name)
 
 
@@ -1766,7 +1889,7 @@ def gpu_new_cmd() -> None:
 
 @gpu_app.command("down")
 def gpu_down_cmd(
-    name: str = typer.Argument("god", help="GPU profile name to stop (default: god)."),
+    name: str = typer.Argument("god", help="Accepted for compatibility; one shared GPU."),
 ) -> None:
     """Stop the inference server and pause the Vast.ai instance via API."""
     cmd_gpu_down(name)
@@ -1774,7 +1897,7 @@ def gpu_down_cmd(
 
 @gpu_app.command("logs")
 def gpu_logs_cmd(
-    name: str = typer.Argument("god", help="GPU profile name (default: god)."),
+    name: str = typer.Argument("god", help="Accepted for compatibility; one shared GPU."),
 ) -> None:
     """Show the inference server log on the GPU (surfaces server-side crashes)."""
     cmd_gpu_logs(gpu_name=name)

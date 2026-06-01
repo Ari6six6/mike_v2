@@ -171,10 +171,16 @@ def _start_ollama_cmd(gpu: GpuConfig) -> str:
     short sleep — that's done in a separate SSH call so SSH session timing
     can't affect the verification.
     """
+    # OLLAMA_MAX_LOADED_MODELS=2 + OLLAMA_KEEP_ALIVE=-1 keep BOTH the senior and
+    # the oracle resident in VRAM at once, behind this one port — the senior and
+    # oracle differ only by served_model_name, never by endpoint. Without these,
+    # Ollama evicts the idle model after a few minutes and the second request
+    # pays a cold reload.
     return (
         "pkill -x ollama 2>/dev/null; "
         "touch /tmp/ollama.log; "
         f"OLLAMA_HOST=0.0.0.0:{gpu.gpu_port} "
+        "OLLAMA_MAX_LOADED_MODELS=2 OLLAMA_KEEP_ALIVE=-1 "
         "nohup ollama serve >/tmp/ollama.log 2>&1 </dev/null & "
         "echo $!"
     )
@@ -657,7 +663,7 @@ def _http_error_message(r: httpx.Response, model: str) -> str:
         msg += (
             f"\n\nThe model '{model}' has no tool-calling template, but Michael always "
             "sends tools. Set `gpu.model_repo` to a tool-capable model "
-            "(e.g. qwen2.5:72b, llama3.1:70b) and re-run `michael gpu up`."
+            "(e.g. NousResearch/Hermes-4.3-36B) and re-run `michael gpu up`."
         )
     elif "not found" in low and model and model in detail:
         msg += (
