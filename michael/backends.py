@@ -442,35 +442,35 @@ def _restart_ollama_on_gpu(gpu: GpuConfig, *, poll_timeout_s: int = 300) -> None
     )
 
 
-_tunnel_proc: Optional[subprocess.Popen] = None  # type: ignore[type-arg]
+_tunnel_procs: dict[str, "subprocess.Popen[bytes]"] = {}
 
 
-def _close_tunnel() -> None:
-    global _tunnel_proc
-    if _tunnel_proc is not None:
-        try:
-            _tunnel_proc.terminate()
-        except Exception:
-            pass
-        _tunnel_proc = None
+def _close_tunnel(name: Optional[str] = None) -> None:
+    """Terminate one named tunnel or all tunnels (if name is None)."""
+    targets = [name] if name else list(_tunnel_procs.keys())
+    for n in targets:
+        proc = _tunnel_procs.pop(n, None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
 
-def _ensure_tunnel(gpu: GpuConfig) -> None:
-    """Auto-spawn SSH port-forward if the model endpoint is not locally reachable.
+def _ensure_tunnel(name: str, gpu: "GpuConfig") -> None:
+    """Auto-spawn SSH port-forward for a named GPU if endpoint is not reachable.
 
-    Safe to call on every `michael run` — if the tunnel is already up (user-managed
-    or from a previous auto-start) it returns immediately. When Termux is killed and
-    restarted, this re-establishes the tunnel without any manual step.
+    Safe to call on every run — returns immediately if already up. Keyed by
+    name so god and junior (or any other GPU) each maintain their own tunnel.
     """
-    global _tunnel_proc
     if not gpu.ssh_host:
         return
     endpoint = f"http://localhost:{gpu.gpu_port}/v1"
     if _ping_endpoint(endpoint):
         return  # already reachable — nothing to do
-    G.console.print("[yellow]tunnel not detected — starting SSH port-forward...[/]")
+    G.console.print(f"[yellow]tunnel {name!r} not detected — starting SSH port-forward...[/]")
     key = os.path.expanduser(gpu.ssh_key_path)
-    _tunnel_proc = subprocess.Popen(
+    _tunnel_procs[name] = subprocess.Popen(
         [
             "ssh", "-p", str(gpu.ssh_port), f"{gpu.ssh_user}@{gpu.ssh_host}",
             "-L", f"{gpu.gpu_port}:localhost:{gpu.gpu_port}",
@@ -488,11 +488,12 @@ def _ensure_tunnel(gpu: GpuConfig) -> None:
     for _ in range(15):
         time.sleep(2)
         if _ping_endpoint(endpoint):
-            G.console.print("[green]tunnel up[/]")
+            G.console.print(f"[green]tunnel {name!r} up[/]")
             return
-    _close_tunnel()
+    _close_tunnel(name)
     raise G.MichaelError(
-        "SSH tunnel failed to come up after 30s — check gpu.ssh_host / ssh_key_path in config"
+        f"SSH tunnel {name!r} failed to come up after 30s — "
+        "check ssh_host / ssh_key_path in config"
     )
 
 

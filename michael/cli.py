@@ -1,6 +1,4 @@
 """CLI commands, Typer bindings, and the interactive REPL."""
-from __future__ import annotations
-
 import json
 import os
 import pathlib
@@ -588,7 +586,7 @@ def _reconnect_ssh_only(cfg: "Config", gpu: "GpuConfig") -> None:
     cfg.save()
 
 
-def _run_ollama_setup(cfg: "Config", gpu: "GpuConfig") -> None:
+def _run_ollama_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> None:
     """Install ollama, start daemon, pull model, save endpoint, print port-forward."""
     # ── Install ollama if missing ──
     cp = _gpu_ssh_run(gpu, "command -v ollama >/dev/null && echo installed || echo missing")
@@ -747,13 +745,17 @@ def _run_ollama_setup(cfg: "Config", gpu: "GpuConfig") -> None:
 
     # ── Save endpoint ──
     endpoint = f"http://localhost:{gpu.gpu_port}/v1"
-    profile_name = cfg.default_model or "god"
+    if not profile_name:
+        profile_name = cfg.default_model or "god"
     if profile_name not in cfg.models:
         from michael.config import ModelProfile
         cfg.models[profile_name] = ModelProfile()
-        cfg.default_model = profile_name
+        if not cfg.default_model:
+            cfg.default_model = profile_name
     cfg.models[profile_name].endpoint = endpoint
     cfg.models[profile_name].served_model_name = gpu.model_repo
+    if profile_name not in ("god", ""):
+        cfg.models[profile_name].gpu_name = profile_name
     cfg.save()
     append_event("gpu.ready", {"host": gpu.ssh_host, "model": gpu.model_repo, "endpoint": endpoint})
 
@@ -772,7 +774,7 @@ def _run_ollama_setup(cfg: "Config", gpu: "GpuConfig") -> None:
     )
 
 
-def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig") -> None:
+def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> None:
     """Install vLLM if missing, start server (downloads model on first run), save endpoint."""
     # ── Detect GPU count ──
     ngpu_cp = _gpu_ssh_run(
@@ -931,13 +933,17 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig") -> None:
 
     # ── Save endpoint ──
     endpoint = f"http://localhost:{gpu.gpu_port}/v1"
-    profile_name = cfg.default_model or "god"
+    if not profile_name:
+        profile_name = cfg.default_model or "god"
     if profile_name not in cfg.models:
         from michael.config import ModelProfile
         cfg.models[profile_name] = ModelProfile()
-        cfg.default_model = profile_name
+        if not cfg.default_model:
+            cfg.default_model = profile_name
     cfg.models[profile_name].endpoint = endpoint
     cfg.models[profile_name].served_model_name = gpu.model_repo
+    if profile_name not in ("god", ""):
+        cfg.models[profile_name].gpu_name = profile_name
     cfg.save()
     append_event("gpu.ready", {"host": gpu.ssh_host, "model": gpu.model_repo, "endpoint": endpoint, "backend": "vllm"})
 
@@ -958,7 +964,7 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig") -> None:
     )
 
 
-def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig") -> None:
+def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> None:
     """Verify SSH, auto-detect installed backend, then dispatch to setup."""
     # ── Check local SSH key exists before attempting connection ──
     key_path = pathlib.Path(gpu.ssh_key_path).expanduser()
@@ -1030,9 +1036,9 @@ def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig") -> None:
 
     # ── Dispatch to backend-specific setup ──
     if gpu.inference_backend == "vllm":
-        _run_vllm_setup(cfg, gpu)
+        _run_vllm_setup(cfg, gpu, profile_name)
     else:
-        _run_ollama_setup(cfg, gpu)
+        _run_ollama_setup(cfg, gpu, profile_name)
 
 
 def cmd_gpu() -> None:
@@ -1053,31 +1059,37 @@ def cmd_gpu() -> None:
     )
 
 
-def cmd_gpu_up() -> None:
+def cmd_gpu_up(gpu_name: str = "god") -> None:
     """Start the selected GPU: resume instance, auto-detect backend, install if needed, start server."""
     cfg = Config.load()
-    gpu = cfg.gpu
 
-    # No GPU selected yet — run selection first
-    if not gpu.ssh_host and not gpu.vast_instance_id:
-        cmd_gpu()
-        cfg = Config.load()
+    if gpu_name == "god":
+        # Primary GPU — existing path, touches cfg.gpu
         gpu = cfg.gpu
-
-    # Resume or connect
-    if gpu.vast_instance_id:
-        _resume_known_instance(cfg, gpu)
+        if not gpu.ssh_host and not gpu.vast_instance_id:
+            cmd_gpu()
+            cfg = Config.load()
+            gpu = cfg.gpu
+        if gpu.vast_instance_id:
+            _resume_known_instance(cfg, gpu)
+        else:
+            G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
+            cp = _gpu_ssh_run(gpu, "echo ok", timeout=60)
+            if cp.returncode != 0:
+                raise G.MichaelError(
+                    f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
+                    "Check ssh_key_path in config or try ssh manually."
+                )
+        _run_gpu_setup_protocol(cfg, gpu)
     else:
-        G.console.print(f"[dim]connecting to {gpu.ssh_user}@{gpu.ssh_host}:{gpu.ssh_port}…[/]")
-        cp = _gpu_ssh_run(gpu, "echo ok", timeout=60)
-        if cp.returncode != 0:
-            raise G.MichaelError(
-                f"GPU unreachable: {cp.stderr.strip()[:200]}\n"
-                "Check ssh_key_path in config or try ssh manually."
-            )
-
-    # Backend + model are chosen inside the protocol, once SSH is confirmed.
-    _run_gpu_setup_protocol(cfg, gpu)
+        # Named secondary GPU — stored in cfg.gpus[gpu_name]
+        from michael.config import GpuConfig as _GpuConfig
+        gpu = cfg.gpus.get(gpu_name, _GpuConfig())
+        G.console.print(f"[bold]Setting up GPU {gpu_name!r}[/] — provide the Vast.ai SSH command or host details.")
+        _manual_ssh_setup(cfg, gpu)
+        cfg.gpus[gpu_name] = gpu
+        cfg.save()
+        _run_gpu_setup_protocol(cfg, gpu, profile_name=gpu_name)
 
 
 def _clear_gpu_known_hosts() -> None:
@@ -1116,11 +1128,11 @@ def cmd_gpu_new() -> None:
     cmd_gpu_up()
 
 
-def cmd_gpu_down() -> None:
+def cmd_gpu_down(gpu_name: str = "god") -> None:
     cfg = Config.load()
-    gpu = cfg.gpu
+    gpu = cfg.get_gpu(gpu_name)
     if not gpu.ssh_host:
-        raise G.MichaelError("no GPU configured — run `michael gpu up` first")
+        raise G.MichaelError(f"no GPU {gpu_name!r} configured — run `michael gpu up {gpu_name}` first")
 
     # Stop inference server via SSH (best-effort — instance may already be off)
     if gpu.inference_backend == "vllm":
@@ -1147,13 +1159,14 @@ def cmd_gpu_down() -> None:
         G.console.print("[dim]no vast_instance_id or vast_api_key — skipping API stop[/]")
         append_event("gpu.stopped", {"host": gpu.ssh_host})
 
-    profile_name = cfg.default_model or "god"
-    if profile_name in cfg.models:
-        cfg.models[profile_name].endpoint = None
+    # Clear endpoint for all profiles that use this GPU
+    for pname, prof in cfg.models.items():
+        if (gpu_name == "god" and not prof.gpu_name) or prof.gpu_name == gpu_name:
+            prof.endpoint = None
     cfg.save()
 
 
-def cmd_gpu_logs(lines: int = 120) -> None:
+def cmd_gpu_logs(lines: int = 120, gpu_name: str = "god") -> None:
     """Tail the inference server log on the GPU so server-side crashes are visible.
 
     The CLI only sees 'Server disconnected' / 'Bad Request' from its side of the
@@ -1161,9 +1174,9 @@ def cmd_gpu_logs(lines: int = 120) -> None:
     it without a manual SSH.
     """
     cfg = Config.load()
-    gpu = cfg.gpu
+    gpu = cfg.get_gpu(gpu_name)
     if not gpu.ssh_host:
-        raise G.MichaelError("no GPU configured — run `michael gpu up` first")
+        raise G.MichaelError(f"no GPU {gpu_name!r} configured — run `michael gpu up {gpu_name}` first")
 
     # Is the server even alive / listening?
     health = _gpu_ssh_run(
@@ -1236,8 +1249,9 @@ def cmd_ask(prompt: str, system: str = "", file: Optional[str] = None) -> None:
     name, profile = cfg.get_model()
     endpoint = _require_endpoint(profile, name)
     _ssh_preflight(cfg)
-    if cfg.gpu.ssh_host:
-        _ensure_tunnel(cfg.gpu)
+    _ask_gpu = cfg.get_gpu(profile.gpu_name)
+    if _ask_gpu.ssh_host:
+        _ensure_tunnel(profile.gpu_name or "god", _ask_gpu)
     user_content = prompt
     if file:
         p = pathlib.Path(file).expanduser()
@@ -1686,27 +1700,33 @@ def gpu_callback(ctx: typer.Context) -> None:
 
 
 @gpu_app.command("up")
-def gpu_up_cmd() -> None:
-    """Start the selected GPU: resume instance, auto-detect backend, install if needed, start server."""
-    cmd_gpu_up()
+def gpu_up_cmd(
+    name: str = typer.Argument("god", help="GPU profile name (default: god). Use 'junior' for the specialist GPU."),
+) -> None:
+    """Start a named GPU. `michael gpu up` starts the primary (god) GPU; `michael gpu up junior` provisions a second instance."""
+    cmd_gpu_up(name)
 
 
 @gpu_app.command("new")
 def gpu_new_cmd() -> None:
-    """Forget the current GPU and pick + start a fresh one."""
+    """Forget the current primary GPU and pick + start a fresh one."""
     cmd_gpu_new()
 
 
 @gpu_app.command("down")
-def gpu_down_cmd() -> None:
+def gpu_down_cmd(
+    name: str = typer.Argument("god", help="GPU profile name to stop (default: god)."),
+) -> None:
     """Stop the inference server and pause the Vast.ai instance via API."""
-    cmd_gpu_down()
+    cmd_gpu_down(name)
 
 
 @gpu_app.command("logs")
-def gpu_logs_cmd() -> None:
+def gpu_logs_cmd(
+    name: str = typer.Argument("god", help="GPU profile name (default: god)."),
+) -> None:
     """Show the inference server log on the GPU (surfaces server-side crashes)."""
-    cmd_gpu_logs()
+    cmd_gpu_logs(gpu_name=name)
 
 
 @app.command(name="status")
@@ -1980,14 +2000,15 @@ def dispatch_repl(line: str) -> None:
         cmd_run(" ".join(rest))
     elif cmd == "gpu":
         sub = rest[0] if rest else ""
+        gpu_name_arg = rest[1] if len(rest) > 1 else "god"
         if sub == "up":
-            cmd_gpu_up()
+            cmd_gpu_up(gpu_name_arg)
         elif sub == "new":
             cmd_gpu_new()
         elif sub == "down":
-            cmd_gpu_down()
+            cmd_gpu_down(gpu_name_arg)
         elif sub == "logs":
-            cmd_gpu_logs()
+            cmd_gpu_logs(gpu_name=gpu_name_arg)
         else:
             cmd_gpu()
     elif cmd == "tools":

@@ -22,6 +22,7 @@ class ModelProfile:
     enable_thinking: bool = False
     tool_uncapable: bool = False
     slim_context: bool = False  # strip H1-H4 package; send only minimal prompt + tool list
+    gpu_name: str = ""  # which GpuConfig entry serves this model (empty = primary "god" GPU)
 
 
 @dataclass
@@ -73,6 +74,7 @@ class Config:
     vps: VpsConfig = field(default_factory=VpsConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     gpu: GpuConfig = field(default_factory=GpuConfig)
+    gpus: dict[str, GpuConfig] = field(default_factory=dict)  # named extra GPU instances
     system_prompt: str = G.DEFAULT_SYSTEM_PROMPT
     system_prompt_file: str = ""
     log_responses: bool = True
@@ -99,6 +101,9 @@ class Config:
         valid_mp = set(ModelProfile.__dataclass_fields__)
         for name, prof in models_raw.items():
             if isinstance(prof, dict):
+                # god profiles get enable_thinking=True unless explicitly set to False
+                if name == "god" and "enable_thinking" not in prof:
+                    prof = {**prof, "enable_thinking": True}
                 models[name] = ModelProfile(**{k: v for k, v in prof.items() if k in valid_mp})
 
         vps_raw = data.pop("vps", None) or {}
@@ -113,9 +118,26 @@ class Config:
         valid_gpu = set(GpuConfig.__dataclass_fields__)
         gpu = GpuConfig(**{k: v for k, v in gpu_raw.items() if k in valid_gpu})
 
-        valid = set(cls.__dataclass_fields__) - {"models", "vps", "sandbox", "gpu"}
+        gpus_raw = data.pop("gpus", {}) or {}
+        gpus: dict[str, GpuConfig] = {}
+        for gname, gcfg in gpus_raw.items():
+            if isinstance(gcfg, dict):
+                gpus[gname] = GpuConfig(**{k: v for k, v in gcfg.items() if k in valid_gpu})
+
+        valid = set(cls.__dataclass_fields__) - {"models", "vps", "sandbox", "gpu", "gpus"}
         clean = {k: v for k, v in data.items() if k in valid}
-        return cls(models=models, vps=vps, sandbox=sandbox, gpu=gpu, **clean)
+        return cls(models=models, vps=vps, sandbox=sandbox, gpu=gpu, gpus=gpus, **clean)
+
+    def get_gpu(self, name: str = "") -> GpuConfig:
+        """Return the GpuConfig for a named GPU profile.
+
+        For the primary GPU ("god" or empty name) falls back to cfg.gpu so
+        existing single-GPU configs continue to work with zero migration.
+        Named secondary GPUs (e.g. "junior") live in cfg.gpus.
+        """
+        if name and name != "god":
+            return self.gpus.get(name, GpuConfig())
+        return self.gpu
 
     def save(self) -> None:
         G.STATE_DIR.mkdir(mode=0o700, exist_ok=True)
@@ -185,7 +207,11 @@ def make_stub_config() -> Config:
     save-time pruning keeps the on-disk file to just what the user (or
     `michael gpu up`) has actually written.
     """
-    return Config(models={"god": ModelProfile()}, default_model="god")
+    return Config(
+        models={"god": ModelProfile(enable_thinking=True)},
+        default_model="god",
+        sandbox=SandboxConfig(passthrough=True),
+    )
 
 
 CONFIG_HELP: dict[str, str] = {
@@ -194,10 +220,18 @@ CONFIG_HELP: dict[str, str] = {
     "models.god.vast_instance_id": "Numeric ID of the rented GPU instance.",
     "models.god.served_model_name": "Model name sent in API requests. Auto-filled by `michael gpu up`. For vllm: HF ID (e.g. 'NousResearch/Hermes-4.3-36B'); for ollama: tag.",
     "models.god.request_timeout_s": "LLM request timeout (seconds).",
+    "models.god.enable_thinking": "Enable <think> reasoning traces (Hermes 4.3 / QwQ). Recommended for the senior model.",
     "models.god.tool_uncapable": "If true, skip tools/tool_choice params and use text-format tool calling instead (for models without a function-calling template).",
+    "models.god.gpu_name": "Which named GPU serves this model (empty = primary gpu). Set to 'junior' for the specialist model.",
+    "models.junior.endpoint": "Junior specialist endpoint — set by `michael gpu up junior`.",
+    "models.junior.served_model_name": "Junior model tag (e.g. 'deephat-v1-7b'). Set by `michael gpu up junior`.",
+    "models.junior.tool_uncapable": "Should be true for base-model fine-tunes that cannot call tools natively.",
+    "models.junior.gpu_name": "Must match the name passed to `michael gpu up` (e.g. 'junior').",
     "gpu.inference_backend": "Inference backend: 'vllm' (default) or 'ollama'. vLLM gives better MoE parallelism and agentic throughput.",
-    "gpu.model_repo": "For vllm: HuggingFace ID e.g. 'deepseek-ai/DeepSeek-V4-Flash'. For ollama: tag e.g. 'qwen2.5:72b'.",
+    "gpu.model_repo": "For vllm: HuggingFace ID e.g. 'NousResearch/Hermes-4.3-36B'. For ollama: tag e.g. 'qwen2.5:72b'.",
     "gpu.gpu_port": "OpenAI-compat port on the GPU (ollama default: 11434, vllm default: 8000 — configurable).",
+    "gpus.<name>.ssh_host": "SSH host for a named secondary GPU (e.g. gpus.junior.ssh_host). Set by `michael gpu up junior`.",
+    "gpus.<name>.gpu_port": "Local port for the secondary GPU tunnel (must differ from primary, e.g. 11435).",
     "gpu.max_model_len": "vLLM only: max context length (--max-model-len). Caps KV cache to fit VRAM. Default 32768; lower it if the engine reports 'KV cache memory' errors at startup, raise it for longer context on bigger GPUs. 0 = let vLLM use the model's full max (often too large for a single GPU).",
     "gpu.gpu_memory_utilization": "vLLM only: fraction of GPU VRAM the engine may use (--gpu-memory-utilization), 0.0–1.0. Default 0.92. Raise toward 0.95 to squeeze in more KV cache, lower if you hit OOM during load.",
     "vps.host": "VPS public IP/hostname (empty = no remote sandbox).",

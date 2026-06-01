@@ -313,15 +313,16 @@ def _run_agent_loop(
     endpoint = _require_endpoint(profile, name)
     _ssh_preflight(cfg)
 
-    if cfg.gpu.ssh_host:
-        _ensure_tunnel(cfg.gpu)
+    _gpu = cfg.get_gpu(profile.gpu_name)
+    if _gpu.ssh_host:
+        _ensure_tunnel(profile.gpu_name or "god", _gpu)
         if not _ping_endpoint(endpoint):
-            if cfg.gpu.inference_backend == "vllm":
+            if _gpu.inference_backend == "vllm":
                 G.console.print("[yellow]model server unreachable — restarting vLLM...[/]")
-                _restart_vllm_on_gpu(cfg.gpu)
+                _restart_vllm_on_gpu(_gpu)
             else:
                 G.console.print("[yellow]model server unreachable — restarting ollama...[/]")
-                _restart_ollama_on_gpu(cfg.gpu)
+                _restart_ollama_on_gpu(_gpu)
 
     client = llm_client(endpoint, "", profile.enable_thinking, profile.tool_uncapable)
     backend = make_backend(cfg)
@@ -332,7 +333,8 @@ def _run_agent_loop(
     backend_label = (
         "remote-podman (vps)" if cfg.vps_active()
         else ("local-podman" if isinstance(backend, LocalPodmanBackend)
-              else "no-sandbox")
+              else ("local-python3 (passthrough)" if cfg.sandbox.passthrough
+                    else "no-sandbox"))
     )
     G.console.print(
         f"[bold cyan]michael {verb_label}[/] [dim]project={project.slug}  "
@@ -402,10 +404,10 @@ def _run_agent_loop(
                     )
                     break
                 except Exception as _conn_exc:
-                    if _attempt == 0 and _is_conn_refused(_conn_exc) and cfg.gpu.ssh_host:
+                    if _attempt == 0 and _is_conn_refused(_conn_exc) and _gpu.ssh_host:
                         G.console.print("[yellow]LLM connection lost — reconnecting tunnel...[/]")
-                        _close_tunnel()
-                        _ensure_tunnel(cfg.gpu)
+                        _close_tunnel(profile.gpu_name or "god")
+                        _ensure_tunnel(profile.gpu_name or "god", _gpu)
                     else:
                         raise
             choice = resp.choices[0]
