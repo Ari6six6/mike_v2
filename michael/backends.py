@@ -366,10 +366,16 @@ def _start_vllm_cmd(
     mem_util = getattr(gpu, "gpu_memory_utilization", 0) or 0
     mem_util_flag = f"--gpu-memory-utilization {mem_util} " if mem_util > 0 else ""
     tool_parser = _vllm_tool_parser(gpu.model_repo)
+    # NCCL_DEBUG=WARN surfaces NCCL errors in /tmp/vllm.log (zero cost when healthy).
+    # NCCL_P2P_DISABLE/IB_DISABLE force socket transport — required on Vast.ai when
+    # multiple GPUs are on separate PCIe buses without NVLink or InfiniBand.
+    nccl_env = "NCCL_DEBUG=WARN "
+    if getattr(gpu, "nccl_p2p_disable", False):
+        nccl_env += "NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 "
     return (
         "touch /tmp/vllm.log; "
         + _GPU_PY +
-        f'nohup "$PY" -m vllm.entrypoints.openai.api_server '
+        f'{nccl_env}nohup "$PY" -m vllm.entrypoints.openai.api_server '
         f"--model {gpu.model_repo} "
         f"--port {gpu.gpu_port} "
         f"--host 0.0.0.0 "
