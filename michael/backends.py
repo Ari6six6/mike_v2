@@ -447,6 +447,7 @@ def _restart_ollama_on_gpu(gpu: GpuConfig, *, poll_timeout_s: int = 300) -> None
 
 
 _tunnel_procs: dict[str, "subprocess.Popen[bytes]"] = {}
+_tunnel_atexit_registered = False
 
 
 def _close_tunnel(name: Optional[str] = None) -> None:
@@ -488,7 +489,10 @@ def _ensure_tunnel(name: str, gpu: "GpuConfig") -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    atexit.register(_close_tunnel)
+    global _tunnel_atexit_registered
+    if not _tunnel_atexit_registered:
+        atexit.register(_close_tunnel)
+        _tunnel_atexit_registered = True
     for _ in range(15):
         time.sleep(2)
         if _ping_endpoint(endpoint):

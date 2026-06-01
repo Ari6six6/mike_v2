@@ -833,25 +833,33 @@ def execute_tool(
             return "forge_tool: code is required"
         tools_dir = pathlib.Path(project.path) / "tools"
         tools_dir.mkdir(exist_ok=True)
-        target = tools_dir / f"{tool_name}.py"
+        target = (tools_dir / f"{tool_name}.py").resolve()
         try:
-            target.write_text(code)
+            target.relative_to(tools_dir.resolve())
+        except ValueError:
+            return "forge_tool: name must not contain path separators or escape the tools directory"
+        # Write to a temp file first; only move into place after validation passes.
+        tmp_path = pathlib.Path(tempfile.mktemp(suffix=".py", dir=tools_dir))
+        try:
+            tmp_path.write_text(code)
         except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
             return f"forge_tool: failed to write {target}: {exc}"
         import importlib.util as _ilu
         try:
-            spec = _ilu.spec_from_file_location(tool_name, target)
+            spec = _ilu.spec_from_file_location(tool_name, tmp_path)
             mod = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
             spec.loader.exec_module(mod)  # type: ignore[union-attr]
             if not hasattr(mod, "TOOL_SCHEMA"):
-                target.unlink(missing_ok=True)
-                return f"forge_tool: TOOL_SCHEMA not found — file deleted, fix and retry"
+                tmp_path.unlink(missing_ok=True)
+                return f"forge_tool: TOOL_SCHEMA not found — file not saved, fix and retry"
             if not callable(getattr(mod, tool_name, None)):
-                target.unlink(missing_ok=True)
-                return f"forge_tool: callable {tool_name!r} not found — file deleted, fix and retry"
+                tmp_path.unlink(missing_ok=True)
+                return f"forge_tool: callable {tool_name!r} not found — file not saved, fix and retry"
         except Exception as exc:
-            target.unlink(missing_ok=True)
-            return f"forge_tool: syntax/import error — file deleted, fix and retry:\n{exc}"
+            tmp_path.unlink(missing_ok=True)
+            return f"forge_tool: syntax/import error — file not saved, fix and retry:\n{exc}"
+        tmp_path.rename(target)
         return f"forge_tool: {tool_name} created at {target} — available immediately in this run"
 
     if name == "fetch_url":
