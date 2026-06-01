@@ -977,6 +977,24 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
             raise G.MichaelError(f"vLLM install failed:\n{(cp.stderr or cp.stdout)[:500]}")
         G.console.print("[green]vLLM installed[/]")
 
+    # ── Ensure curand dev headers (flashinfer JIT-compiles sampling kernels) ──
+    # Some Vast.ai images ship the CUDA runtime but not the curand-dev headers,
+    # causing flashinfer to fail at first use with "fatal error: curand.h: No
+    # such file or directory".  Install libcurand-dev idempotently if missing.
+    cp = _gpu_ssh_run(
+        gpu,
+        'find /usr/local/cuda/include /usr/include -name curand.h 2>/dev/null | grep -q . && echo found || echo missing',
+        timeout=15,
+    )
+    if "missing" in cp.stdout:
+        G.console.print("[cyan]Installing curand dev headers (needed by flashinfer sampler)…[/]")
+        _gpu_ssh_run(
+            gpu,
+            'apt-get install -y libcurand-dev 2>/dev/null || true',
+            timeout=120,
+        )
+        G.console.print("[green]curand headers installed[/]")
+
     # ── Preflight: torch must be able to talk to this GPU's driver ──
     # pip's torch is built for a recent CUDA; on older cards (e.g. Titan RTX)
     # the driver can be too old, and vLLM dies deep in engine init with a
