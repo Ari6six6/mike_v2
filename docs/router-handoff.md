@@ -1,213 +1,120 @@
-# Router Handoff — Note from Session `claude/router-handoff-docs-9gTsg`
+# Handoff: the Router role (next session)
 
-Written 2026-06-01. This doc is the only context you need to start the router
-build. Read it fully before writing a line of code. Then ask the four questions
-at the bottom before you start.
+> A note from a past session to a future one. Read this top-to-bottom before
+> touching code. It assumes the **analyst** role has already landed (branch
+> `claude/gpu-data-collection-c5tgc`): per-turn `turn.telemetry`, deterministic
+> run features, a classed training corpus, and per-run scorecards.
 
----
+## Context — where this fits
 
-## What the router is
+Project Michael is becoming a "firm" of LLM roles. So far:
 
-Michael has two kinds of model profiles: **doers** (the senior Hermes loop that
-reads files, runs tools, and commits) and **oracles** (specialists called via
-`spawn_specialist`, which are stateless text generators with no tools). Right
-now the senior decides manually which oracle to call, or the user hard-codes
-`--model` on the CLI.
+- **Doers** — the senior model running the flat tool loop (`michael/agent.py`
+  `_run_agent_loop`). One model is chosen per run (`--model` / `default_model`).
+- **Oracles** — specialist models called as pure text oracles via
+  `spawn_specialist(model_name, prompt)` (`toolbox/spawn_specialist.py`). The
+  senior must invoke this **manually** and decide which specialist to use.
+- **Analyst** — post-run judge (`michael/analyst.py`): writes `dataset/` records
+  + `scorecards/` and `run.scored` events.
 
-The router sits between the task intake and model dispatch. Its job is:
-given a task description (the user's prompt), pick the right model profile
-to run it on. That's the whole thing.
+The **router** is the missing seat: instead of the senior hand-picking a
+specialist every time, the router *automatically* decides — given a task or
+subtask — which model profile should handle it (or that the senior should keep
+it). It's the dispatch/orchestration layer the analyst's data eventually feeds.
 
-Why it matters: once you have 3+ profiles — a general senior, a code
-specialist, an exploit writer, a log analyst — ad-hoc selection breaks down.
-The router makes dispatch automatic and, over time, learnable from feedback.
+This was deliberately left out of the analyst PR to keep that slice clean.
 
----
+## What already exists (verify before building — cite file:line)
 
-## What already exists to reuse
+- **Model profiles**: `cfg.models.<name>` (`michael/config.py:14-26` ModelProfile;
+  loaded `config.py:101-109`). `cfg.get_model(name)` (`config.py:151-161`) returns
+  `(name, profile)`. Profiles carry `tool_uncapable`, `enable_thinking`,
+  `gpu_name`, `slim_context`.
+- **Named GPUs + tunnels**: `cfg.gpus.<name>` (`config.py:51-79`), `cfg.get_gpu()`
+  (`config.py:133-142`), `_ensure_tunnel(name, gpu)` (`michael/backends.py:482-534`),
+  unique `gpu_port` per GPU.
+- **Specialist call pattern** (reuse verbatim): `spawn_specialist.py:64-104` —
+  resolve profile, ensure tunnel, `LLMClient(profile.endpoint).chat.completions
+  .create(...)` with no tools, return text.
+- **Run loop seam**: tool dispatch happens at `agent.py` ~`_run_agent_loop`
+  (the `for tc in tool_calls` block). The senior already decides to call
+  `spawn_specialist` as one tool among many.
+- **Feedback substrate** (from the analyst): `<project>/scorecards/<run_id>.json`
+  (`scores`, `dominant_class`, `features`) and `<project>/dataset/records.jsonl`
+  (`class`, `quality` per turn). A learned router can read these.
 
-**`cfg.models` and `cfg.get_model()`** — `michael/config.py:151`. All model
-profiles live in `cfg.models` (a `dict[str, ModelProfile]`). `get_model(name)`
-resolves a profile by name. The router reads this dict to know what profiles
-are available; it doesn't maintain its own registry.
+## Goal
 
-**`_ensure_tunnel`** — imported at `michael/tools.py:14`, used at lines 318 and
-410. Handles SSH control-master bringup for remote GPUs. `spawn_specialist` in
-`toolbox/spawn_specialist.py:88-92` shows the exact call pattern: look up the
-profile's `gpu_name`, get the `GpuConfig`, call `_ensure_tunnel(gpu_key, gpu)`
-before making the HTTP request. Any routing path that dispatches to a remote
-profile needs this same setup.
+Add a routing layer that, given a unit of work, selects the best model profile
+to execute it — automatically — and (later) learns the mapping from the analyst's
+scorecards. Ship it as a clean vertical slice, same as the analyst:
 
-**`spawn_specialist` call pattern** — `toolbox/spawn_specialist.py:64-104`.
-This is the complete reference implementation for calling a model profile
-as a text oracle: load config, validate profile has endpoint and
-served_model_name, optionally bring up tunnel, call `LLMClient`. The router's
-dispatch path for oracle profiles mirrors this exactly.
+1. **Routing decision** — a `michael/router.py` with a pure function
+   `route(task, cfg, *, features=None) -> str` returning a profile name. Start
+   **rule/heuristic-based** (the analyst precedent: heuristics first, the
+   model-as-judge layered on later — confirm this ordering with the user, since
+   for the analyst they were unsure about heuristics-first but rejected pure
+   offline). Candidate signals: task keywords (codegen→junior, recon→senior),
+   declared task type, profile capabilities (`tool_uncapable` ⇒ oracle-only),
+   project `mode`.
+2. **A `route_task` tool** (or auto-dispatch) so the senior can delegate a
+   subtask and have the router pick + run the specialist, returning text — i.e.
+   `spawn_specialist` with the `model_name` chosen *for* the senior instead of
+   *by* it. Decide with the user: a new tool vs. wrapping `spawn_specialist`.
+3. **Learned routing (later, gated)** — once scorecards accumulate, bias routing
+   toward the profile with the best historical `scores` for that task class.
+   Read `~/.michael/dataset/*.jsonl` + `scorecards/`. Keep behind a config flag,
+   default off, exactly like `analyst_enabled`.
 
-**Analyst scorecards / dataset** — the analyst role (not yet built, but planned
-as a mode-judged project role) will produce structured scorecards per run:
-model profile used, task type, outcome, latency, user rating. This is the
-natural learning substrate for part 3 below. The router's bias table reads from
-these scorecards once they exist; until then it operates on heuristics alone.
+## Files likely touched
 
----
+- `michael/router.py` *(new)* — `route()`, capability checks, optional learned
+  bias from analyst data.
+- `toolbox/route_task.py` *(new)* OR extend `toolbox/spawn_specialist.py` — the
+  tool surface the senior calls.
+- `michael/config.py` — a `router_enabled` flag + `CONFIG_HELP`; maybe a
+  `models.<name>.skills`/tags field so routing can match task→profile.
+- `michael/agent.py` — only if doing auto-dispatch inside the loop (vs. a tool).
+- `scripture/` — if the router becomes a model-judged role, a `router.md`
+  contract (remember: `load_scripture` treats `recon/model/build/analyst` as
+  mode-specific stems — add `"router"` there too so it doesn't leak into every
+  run; see `michael/utils.py` `load_scripture`).
 
-## The build — three parts
+## Reuse, don't reinvent
 
-### Part 1: Heuristic `route()`
+- Tunnel + `LLMClient` call → copy `spawn_specialist.py:85-104`.
+- Profile resolution → `cfg.get_model` / `cfg.models`.
+- Feature inputs → `michael.analyst.compute_run_features` (already computes the
+  signals a learned router would want).
+- Config flag + CONFIG_HELP pattern → `analyst_enabled` in `config.py`.
+- Event logging → `append_event("route.decided", {...}, project=project)`; add the
+  new event type to the docs block in `michael/project.py:17-48`.
 
-A pure function: `route(prompt: str, profiles: dict[str, ModelProfile]) -> str`.
+## Verification (offline, no GPU)
 
-Returns a profile name. Initial logic: keyword and tag matching.
+- Unit-test `route()` purely: feed tasks + a fake `cfg.models` (capabilities) and
+  assert the chosen profile; assert `tool_uncapable` profiles are never handed
+  tool-requiring work.
+- Test the learned-bias path by seeding fake scorecards/dataset and asserting the
+  router prefers the higher-scoring profile for a class.
+- Test the tool with a monkeypatched `michael.backends.LLMClient` stub (same idiom
+  as `tests/test_michael.py::test_run_analyst_writes_corpus_and_scorecard`).
+- Disabled path: `router_enabled=False` ⇒ behavior identical to today (senior
+  calls `spawn_specialist` manually). Prove zero behavior change.
 
-```
-exploit / CVE / shellcode / payload  → "junior" (exploit specialist)
-log / alert / SIEM / triage          → "analyst"  (log model)
-code / refactor / fix / test         →  default doer
-<anything else>                      →  default doer (god / hermes)
-```
+## Out of scope (name it, don't drift)
 
-Tags on `ModelProfile` are a natural extension point — add a `tags: list[str]`
-field and let the heuristic score against them. But don't add tags on day one;
-start with keyword matching and see if it's enough.
+- Multi-agent parallel execution / a real scheduler. The router *chooses*; it does
+  not run several specialists concurrently (yet).
+- Sandbox target replicas (the recon "engine" half deliberately skipped).
+- Actually fine-tuning specialists — the dataset feeds that downstream.
 
-Location: new file `michael/router.py`. No CLI command, no tool schema yet —
-just a function you can test in isolation.
+## First moves for the next session
 
-### Part 2: `route_task` tool
-
-Expose `route()` to the LLM as a tool so the senior can explicitly re-route
-mid-run if it figures out the task is better handled by a specialist.
-
-Schema: `route_task(prompt: str) -> str` — returns the selected profile name
-and a brief reason. The LLM can then call `load_model(profile)` (already
-exists) to switch.
-
-Location: `toolbox/route_task.py`. Follows the standard `TOOL_SCHEMA` +
-function pattern. Auto-executes (no confirmation needed — it's read-only).
-
-Wire it into `_load_dynamic_tools` at `michael/agent.py:107` — it should load
-in all modes, same as `spawn_specialist`.
-
-### Part 3: Learned bias from scorecards (optional, do last)
-
-Once the analyst is building scorecards, the router can weight its keyword
-scores by observed success rates per (task-type, profile) pair. Keep it simple:
-a JSON bias table in `~/.michael/router_bias.json`, updated by a
-`michael router update-bias` CLI subcommand that reads recent scorecards.
-
-Don't build this until scorecards exist. Mention it in a `# TODO` in
-`michael/router.py` and leave it there.
-
----
-
-## Files to touch
-
-| File | What changes |
-|------|--------------|
-| `michael/router.py` | New — the `route()` function and bias loader |
-| `toolbox/route_task.py` | New — tool schema + thin wrapper around `route()` |
-| `michael/agent.py` | Wire `route()` into dispatch before the first LLM call (optional: auto-route if no `--model` flag given) |
-| `michael/project.py` | Only if router becomes a project mode — add `"router"` to `VALID_MODES` (line 55) |
-| `michael/utils.py` | See the `load_scripture` gotcha below |
-| `michael/config.py` | Only if you add `tags: list[str]` to `ModelProfile` — defer this |
-
----
-
-## `load_scripture` gotcha — read this before you add a router mode
-
-`michael/utils.py:439` — `load_scripture`:
-
-```python
-known_modes = {"recon", "model", "build"}
-...
-if f.stem in known_modes and f.stem != mode:
-    continue  # mode-specific file, wrong mode
-```
-
-If you create a `scripture/router.txt` file (so the router mode gets its own
-system-prompt fragment), it will silently load in ALL modes because `"router"`
-is not in `known_modes` — there's nothing to filter it out. The fix is a
-one-liner: add `"router"` to the set at line 448. The same gap was just fixed
-for the analyst mode on this branch (`"analyst"` was missing and had to be
-added). Don't forget it.
-
-If the router is never a project mode and never gets a scripture file, you
-can skip this. But if it does — fix line 448 first.
-
----
-
-## Offline verification
-
-```bash
-# Unit test route() directly — no GPU needed
-python - <<'EOF'
-from michael.router import route
-from michael.config import ModelProfile
-profiles = {
-    "god":    ModelProfile(endpoint="x", served_model_name="hermes"),
-    "junior": ModelProfile(endpoint="y", served_model_name="deephat"),
-}
-assert route("write an exploit for CVE-2024-1234", profiles) == "junior"
-assert route("refactor the parser module", profiles) == "god"
-print("ok")
-EOF
-
-# Load the tool schema and confirm it appears in tool listing
-python -c "
-import importlib.util, pathlib
-spec = importlib.util.spec_from_file_location('rt', 'toolbox/route_task.py')
-m = importlib.util.load_from_spec(spec); spec.loader.exec_module(m)
-print(m.TOOL_SCHEMA['function']['name'])
-"
-```
-
-No integration test against a live model is needed to ship parts 1 and 2.
-Part 3 requires scorecards on disk; mock them with a fixture JSON file.
-
----
-
-## Out of scope
-
-- Multi-label routing (a task belonging to two profiles) — not needed, pick one.
-- Routing based on cost or latency — premature; add to bias table in part 3 if wanted.
-- A `michael route <prompt>` CLI command for dry-run inspection — nice to have,
-  but not blocking. Add it after parts 1 and 2 are solid.
-- Changing how `michael run --model` works — that flag stays authoritative and
-  skips the router entirely.
-
----
-
-## First moves — ask these before writing code
-
-1. **Should the router auto-run on every `michael run` call (no `--model` flag),
-   or only when the LLM explicitly calls `route_task`?**
-   Auto-run is lower friction; explicit tool call gives the LLM more control.
-   Recommendation: auto-run as the default, tool call as the override.
-
-2. **Which profile names are in the config right now, and do any already have
-   implied task domains?** Run `michael config` or read `~/.michael/config.json`
-   before hard-coding keyword → profile mappings. The heuristics need to
-   map to real profile names.
-
-3. **Is the analyst mode (and its scorecards) already built, or still planned?**
-   If it doesn't exist yet, skip part 3 entirely and leave the TODO comment.
-
-4. **Should `ModelProfile` gain a `tags` field, or should keyword matching stay
-   purely in `router.py`?** Tags make the heuristic extensible but add schema
-   churn. Defer unless the user asks for it.
-
----
-
-## Branch reminder
-
-**Do not reuse `claude/router-handoff-docs-9gTsg`** — that branch only contains
-this doc. Start fresh:
-
-```bash
-git checkout main
-git pull origin main
-git checkout -b claude/router-<short-description>
-```
-
-Then build on that branch and push there.
+1. Re-read this file and the analyst code (`michael/analyst.py`) for the
+   heuristics-first precedent.
+2. Ask the user: (a) heuristics-first or model-judged router? (b) new
+   `route_task` tool vs. auto-dispatch in the loop? (c) should routing learn from
+   scorecards now or later?
+3. Plan → confirm → implement the slice → tests → push to a fresh
+   `claude/router-*` branch (do **not** reuse the analyst branch).
