@@ -287,19 +287,26 @@ def _vllm_tool_parser(model_repo: str) -> str:
 def _vllm_crash_report(gpu: GpuConfig) -> str:
     """Pull the real root cause out of /tmp/vllm.log after an engine crash.
 
-    vLLM's V1 engine runs EngineCore in a child process; the actual error is
-    logged *there*, above the API server's generic "Engine core initialization
-    failed" wrapper. A small tail misses it, so we surface both a grep of the
-    likely root-cause lines and a generous tail of the log.
+    vLLM's V1 engine spawns WorkerProc subprocesses whose failures are logged
+    *before* the EngineCore/APIServer wrapper errors. Filtering out the noisy
+    EngineCore/APIServer lines and taking the head of what remains surfaces the
+    actual worker crash (e.g. CUDA OOM, no kernel image). We fall back to the
+    head of all matching lines if the filter leaves nothing, and always append a
+    generous tail of the full log for context.
     """
     pattern = (
         "error|exception|traceback|runtimeerror|valueerror|assert|"
         "importerror|modulenotfound|out of memory|no kernel image|"
         "not supported|unsupported|compute capability"
     )
+    # Strip EngineCore/APIServer wrapper lines so the head of grep results
+    # shows the WorkerProc crash rather than the generic init-failed chain.
     cmd = (
         "echo '--- likely root cause ---'; "
-        f"grep -niE '{pattern}' /tmp/vllm.log 2>/dev/null | tail -30; "
+        f"WORKER=$(grep -niE '{pattern}' /tmp/vllm.log 2>/dev/null "
+        r"| grep -vE '\(EngineCore pid=|\(APIServer pid='); "
+        f'if [ -n "$WORKER" ]; then echo "$WORKER" | head -30; '
+        f"else grep -niE '{pattern}' /tmp/vllm.log 2>/dev/null | head -30; fi; "
         "echo '--- /tmp/vllm.log (last 120 lines) ---'; "
         "tail -120 /tmp/vllm.log 2>&1"
     )
