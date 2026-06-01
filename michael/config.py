@@ -80,6 +80,7 @@ class Config:
     system_prompt: str = G.DEFAULT_SYSTEM_PROMPT
     system_prompt_file: str = ""
     log_responses: bool = True
+    analyst_enabled: bool = False  # run the post-run analyst (needs a models.analyst profile)
     boot_poll_s: int = 10
     scripture_dir: str = "scripture"
     workbench_root: str = "~/workbench"
@@ -249,7 +250,12 @@ CONFIG_HELP: dict[str, str] = {
     "sandbox.passthrough": "If true, run sandbox code directly via python3 (no container isolation).",
     "system_prompt": "Default system prompt for the agent loop.",
     "system_prompt_file": "If set, read system prompt from this file.",
-    "log_responses": "If true, log full LLM responses to events.jsonl.",
+    "log_responses": "If true, log full LLM responses to events.jsonl. Strongly recommended when analyst_enabled is on — training records lose the assistant's reasoning text without it.",
+    "analyst_enabled": "If true, run the analyst after every run: it judges the run into data classes, writes a classed training corpus and a per-run scorecard. Off by default (one extra GPU call per run). Requires a 'models.analyst' profile.",
+    "models.analyst.endpoint": "Analyst model endpoint. Reuse the senior GPU by setting models.analyst.gpu_name to 'god' and pointing endpoint at the same server.",
+    "models.analyst.served_model_name": "Analyst model tag/ID sent in API requests.",
+    "models.analyst.gpu_name": "Which named GPU serves the analyst (set 'god' to reuse the senior's warm tunnel — no second GPU needed).",
+    "models.analyst.request_timeout_s": "Analyst request timeout (seconds).",
     "boot_poll_s": "Poll interval while waiting for the inference server to come up.",
     "scripture_dir": "Path to scripture files (relative to repo root, default 'scripture').",
 }

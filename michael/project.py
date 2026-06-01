@@ -28,6 +28,12 @@ import michael.globals as G
 #   prompt.sent — user entered a prompt
 #   assistant.message — LLM generated a response (full text if log_responses=true)
 #   assistant.ja — LLM signaled completion with "Ja" passcode
+#   turn.telemetry — per-turn latency/token/finish_reason/tool-call counts (one per turn)
+#
+# Analyst (post-run judgment, only when analyst_enabled):
+#   run.scored — analyst scorecard summary for a finished run
+#   analyst.completed — analyst wrote dataset records + scorecard
+#   analyst.failed — analyst errored or the model was unreachable (run is unaffected)
 #
 # Tool execution:
 #   tool.staged — tool call staged (write_file, apply_patch)

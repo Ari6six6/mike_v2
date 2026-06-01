@@ -20,6 +20,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(michael_globals, "STATE_FILE_PATH", state / "state.json")
     monkeypatch.setattr(michael_globals, "PROJECTS_DIR", state / "projects")
     monkeypatch.setattr(michael_globals, "REPL_HISTORY_PATH", state / "repl_history")
+    monkeypatch.setattr(michael_globals, "GLOBAL_DATASET_DIR", state / "dataset")
     state.mkdir()
     return state
 
@@ -845,7 +846,7 @@ def test_recon_report_writes_raw_and_report(tmp_path):
         {"tool": "dir_enum", "args": {"base": "http://example.com"},
          "result": "/admin (403)"},
     ]
-    agent._write_recon_report(proj, captured, reason="committed")
+    agent._write_recon_report(proj, Config(), captured, reason="committed")
 
     recon = tmp_path / "recone" / "recon"
     raw = (recon / "raw.jsonl").read_text().strip().splitlines()
@@ -863,7 +864,7 @@ def test_recon_report_writes_raw_and_report(tmp_path):
 
 def test_recon_report_flags_empty_run_loudly(tmp_path):
     proj = _proj(tmp_path)
-    agent._write_recon_report(proj, [], reason="no-tool-exit")
+    agent._write_recon_report(proj, Config(), [], reason="no-tool-exit")
     report = (tmp_path / "recone" / "recon" / "report.md").read_text()
     assert "NO DATA CAPTURED" in report
     assert "tool results captured: 0" in report
@@ -872,11 +873,199 @@ def test_recon_report_flags_empty_run_loudly(tmp_path):
 def test_recon_report_appends_across_runs(tmp_path):
     proj = _proj(tmp_path)
     agent._write_recon_report(
-        proj, [{"tool": "a", "args": {}, "result": "r1"}], reason="committed")
+        proj, Config(), [{"tool": "a", "args": {}, "result": "r1"}], reason="committed")
     agent._write_recon_report(
-        proj, [{"tool": "b", "args": {}, "result": "r2"}], reason="max-turns")
+        proj, Config(), [{"tool": "b", "args": {}, "result": "r2"}], reason="max-turns")
     raw = (tmp_path / "recone" / "recon" / "raw.jsonl").read_text().strip().splitlines()
     assert len(raw) == 2
     # report.md reflects the most recent run only
     report = (tmp_path / "recone" / "recon" / "report.md").read_text()
     assert "exit reason: max-turns" in report
+
+
+# ---- analyst: telemetry, features, judgment, corpus + scorecard ----------
+
+from michael.config import ModelProfile
+
+
+def test_completion_response_carries_usage_and_finish_reason():
+    # The per-turn telemetry depends on these fields surviving on the response
+    # dataclasses — guard against a refactor silently dropping them.
+    from michael.backends import _CompletionResponse, _Choice
+    r = _CompletionResponse(
+        choices=[_Choice(content="hi", tool_calls=None, finish_reason="stop")],
+        usage={"total_tokens": 7},
+    )
+    assert r.usage["total_tokens"] == 7
+    assert r.choices[0].finish_reason == "stop"
+
+
+def test_compute_run_features_counts_and_recovery():
+    import michael.analyst as analyst
+    events = [
+        {"type": "agent.started", "payload": {}},
+        {"type": "turn.telemetry", "payload": {"turn": 1, "latency_ms": 100,
+                                               "total_tokens": 40, "tool_calls": ["write_file"]}},
+        {"type": "tool.verify_failed", "payload": {}},
+        {"type": "turn.telemetry", "payload": {"turn": 2, "latency_ms": 200,
+                                               "total_tokens": 60, "tool_calls": ["apply_patch"]}},
+        {"type": "tool.executed", "payload": {}},
+    ]
+    captured = [
+        {"tool": "x", "args": {}, "result": "error: boom"},
+        {"tool": "y", "args": {}, "result": "ok"},
+    ]
+    f = analyst.compute_run_features(events, captured, reason="committed")
+    assert f["committed"] is True
+    assert f["turns_used"] == 2
+    assert f["verify_failures"] == 1
+    assert f["recovery_after_failure"] is True   # failure then later tool.executed
+    assert f["dead_end_turns"] == 1              # the "error: boom" result
+    assert f["total_tokens"] == 100
+    assert f["avg_latency_ms"] == 150
+    assert f["tool_histogram"] == {"write_file": 1, "apply_patch": 1}
+
+
+def test_compute_run_features_windows_to_last_run():
+    import michael.analyst as analyst
+    events = [
+        {"type": "agent.started", "payload": {}},
+        {"type": "tool.verify_failed", "payload": {}},   # belongs to the OLD run
+        {"type": "agent.started", "payload": {}},
+        {"type": "turn.telemetry", "payload": {"turn": 1, "tool_calls": []}},
+    ]
+    f = analyst.compute_run_features(events, [], reason="no-tool-exit")
+    assert f["verify_failures"] == 0   # old-run failure excluded by the window
+    assert f["turns_used"] == 1
+
+
+def test_extract_json_handles_fenced_and_prose():
+    import michael.analyst as analyst
+    assert analyst._extract_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert analyst._extract_json('here you go: {"a": {"b": 2}} done') == {"a": {"b": 2}}
+    assert analyst._extract_json("no json here") is None
+
+
+def test_normalize_records_enforces_enum_and_stamps_metadata():
+    import michael.analyst as analyst
+    proj = _types.SimpleNamespace(slug="s", mode="recon")
+    recs, dropped = analyst._normalize_records(
+        [{"class": "recovery", "turn": 1}, {"class": "bogus"}, {"turn": 2}],
+        run_id="s:t", project=proj, features={"committed": True},
+        analyst_model="analyst", ts="2026-06-01T00:00:00+00:00",
+    )
+    assert len(recs) == 1 and dropped == 2
+    assert recs[0]["schema"] == "michael.dataset.v1"
+    assert recs[0]["run_id"] == "s:t"
+    assert recs[0]["project"] == "s"
+    assert recs[0]["features"] == {"committed": True}
+
+
+class _StubLLMClient:
+    """Stand-in for backends.LLMClient: returns canned analyst JSON."""
+    canned = ""
+
+    def __init__(self, *a, **k):
+        pass
+
+    @property
+    def chat(self):
+        return self
+
+    @property
+    def completions(self):
+        return self
+
+    def create(self, **k):
+        return _types.SimpleNamespace(
+            choices=[_types.SimpleNamespace(content=type(self).canned)],
+            usage={},
+        )
+
+
+def test_run_analyst_writes_corpus_and_scorecard(home, workspace, monkeypatch):
+    import michael.analyst as analyst
+    import michael.backends as backends
+    p = m.create_project("an-run", workspace)
+    # Seed a finished run in the project event log.
+    m.append_event("agent.started", {"model": "god"}, project=p)
+    m.append_event("prompt.sent", {"prompt": "fix the bug"}, project=p)
+    m.append_event("turn.telemetry", {"turn": 1, "latency_ms": 120,
+                                       "finish_reason": "tool_calls", "total_tokens": 50,
+                                       "tool_calls": ["write_file"], "n_tool_calls": 1,
+                                       "content_chars": 10, "dropped_context_msgs": 0}, project=p)
+    m.append_event("assistant.message", {"chars": 10, "turn": 1, "text": "patching"}, project=p)
+
+    _StubLLMClient.canned = _json.dumps({
+        "records": [
+            {"turn": 1, "class": "productive_edit",
+             "input": {"goal": "fix the bug"},
+             "action": {"tool_calls": [{"name": "write_file", "args": {}}]},
+             "outcome": {"verify_rc": 0, "delta_mismatch": False},
+             "label_rationale": "clean patch", "quality": 0.9},
+            {"turn": 2, "class": "NOT_A_REAL_CLASS"},  # must be dropped
+        ],
+        "scorecard": {"dominant_class": "successful_commit",
+                      "scores": {"goal_completion": 0.9}, "overall": 0.85,
+                      "narrative": "good run"},
+    })
+    monkeypatch.setattr(backends, "LLMClient", _StubLLMClient)
+
+    cfg = Config(
+        models={"analyst": ModelProfile(endpoint="http://x/v1", served_model_name="judge")},
+        analyst_enabled=True,
+    )
+    analyst.run_analyst(p, cfg, reason="committed",
+                        captured=[{"tool": "write_file", "args": {}, "result": "ok"}])
+
+    # Per-project corpus
+    recs = (pathlib.Path(p.path) / "dataset" / "records.jsonl").read_text().strip().splitlines()
+    assert len(recs) == 1   # the bogus-class record was dropped
+    rec0 = _json.loads(recs[0])
+    assert rec0["class"] == "productive_edit"
+    assert rec0["run_id"].startswith("an-run:")
+    assert rec0["project"] == "an-run"
+    # Cross-project corpus copy
+    assert (michael_globals.GLOBAL_DATASET_DIR / "an-run.jsonl").is_file()
+    # Scorecard
+    scs = list((pathlib.Path(p.path) / "scorecards").glob("*.json"))
+    assert len(scs) == 1
+    sc = _json.loads(scs[0].read_text())
+    assert sc["dominant_class"] == "successful_commit"
+    assert sc["features"]["committed"] is True   # deterministic features attached
+    assert sc["n_records"] == 1
+    # Events
+    events = m.iter_events(p.events_path)
+    assert any(e["type"] == "run.scored" for e in events)
+    assert any(e["type"] == "analyst.completed" for e in events)
+
+
+def test_run_analyst_degrades_when_model_unreachable(home, workspace, monkeypatch):
+    import michael.analyst as analyst
+    p = m.create_project("an-degrade", workspace)
+    m.append_event("agent.started", {"model": "god"}, project=p)
+    # _call_analyst returns None (e.g. GPU down) -> features-only scorecard, no records.
+    monkeypatch.setattr(analyst, "_call_analyst", lambda *a, **k: None)
+    cfg = Config(
+        models={"analyst": ModelProfile(endpoint="http://x/v1", served_model_name="judge")},
+        analyst_enabled=True,
+    )
+    analyst.run_analyst(p, cfg, reason="committed", captured=[])
+    assert not (pathlib.Path(p.path) / "dataset").exists()
+    scs = list((pathlib.Path(p.path) / "scorecards").glob("*.json"))
+    assert len(scs) == 1
+    sc = _json.loads(scs[0].read_text())
+    assert sc["scores"] is None
+    assert sc["features"]["committed"] is True
+
+
+def test_recon_report_runs_analyst_only_when_enabled(home, workspace):
+    # Default Config has analyst_enabled=False -> recon files written, no analyst output.
+    p = m.create_project("an-off", workspace)
+    agent._write_recon_report(
+        p, Config(), [{"tool": "x", "args": {}, "result": "r"}], reason="committed")
+    assert (pathlib.Path(p.path) / "recon" / "raw.jsonl").is_file()
+    assert not (pathlib.Path(p.path) / "dataset").exists()
+    assert not (pathlib.Path(p.path) / "scorecards").exists()
+    events = m.iter_events(p.events_path)
+    assert not any(e["type"] == "run.scored" for e in events)

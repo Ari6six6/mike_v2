@@ -445,7 +445,7 @@ def load_scripture(scripture_dir: str, mode: str = "") -> str:
     p = pathlib.Path(scripture_dir).expanduser()
     if not p.is_dir():
         return ""
-    known_modes = {"recon", "model", "build"}
+    known_modes = {"recon", "model", "build", "analyst"}
     parts: list[str] = []
     for f in sorted(p.iterdir()):
         if not (f.is_file() and _is_text(f)):

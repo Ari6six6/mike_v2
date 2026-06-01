@@ -22,6 +22,7 @@ REPL_HISTORY_PATH = STATE_DIR / "repl_history"
 GLOBAL_TOOLS_DIR = STATE_DIR / "toolbox"
 TOOLS_CATALOG_PATH = STATE_DIR / "tools_catalog.json"
 GPU_KNOWN_HOSTS_PATH = STATE_DIR / "gpu_known_hosts"
+GLOBAL_DATASET_DIR = STATE_DIR / "dataset"   # cross-project training corpus (analyst output)
 
 MODELS_SUBDIR = "models"   # relative to project.path
 

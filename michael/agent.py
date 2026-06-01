@@ -5,6 +5,7 @@ import importlib.util
 import json
 import pathlib
 import re
+import time
 from typing import Any
 
 import michael.globals as G
@@ -182,7 +183,7 @@ def _write_news(project: Project, content: str) -> None:
 
 
 def _write_recon_report(
-    project: Project, captured: list[dict[str, Any]], *, reason: str
+    project: Project, cfg: Config, captured: list[dict[str, Any]], *, reason: str
 ) -> None:
     """Persist every captured tool result for this run, on every exit path.
 
@@ -260,6 +261,13 @@ def _write_recon_report(
             )
     except Exception as exc:  # never silent
         G.err.print(f"[red]recon report failed:[/] {exc}")
+
+    # Post-run analyst: judge this run into data classes + a scorecard. Fully
+    # guarded inside run_analyst — it can never break a run that already finished.
+    if cfg.analyst_enabled and "analyst" in cfg.models:
+        from michael.analyst import run_analyst
+
+        run_analyst(project, cfg, reason=reason, captured=captured)
 
 
 def _rescue_staged(project: Project, pending: PendingChanges) -> None:
@@ -392,6 +400,7 @@ def _run_agent_loop(
                 append_event(
                     "context.trimmed", {"dropped": dropped, "turn": turn}, project=project
                 )
+            _t0 = time.monotonic()
             for _attempt in range(2):
                 try:
                     resp = client.chat.completions.create(
@@ -410,10 +419,33 @@ def _run_agent_loop(
                         _ensure_tunnel(profile.gpu_name or "god", _gpu)
                     else:
                         raise
+            latency_ms = round((time.monotonic() - _t0) * 1000)
             choice = resp.choices[0]
             content = choice.content or ""
             if content:
                 last_content = content
+
+            tool_calls = choice.tool_calls or []
+
+            # Per-turn telemetry — the usage dict and finish_reason already ride the
+            # completion response; nothing else reads them. Capture once per turn.
+            usage = resp.usage or {}
+            append_event(
+                "turn.telemetry",
+                {
+                    "turn": turn,
+                    "latency_ms": latency_ms,
+                    "finish_reason": choice.finish_reason,
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "total_tokens": usage.get("total_tokens"),
+                    "tool_calls": [tc.name for tc in tool_calls],
+                    "n_tool_calls": len(tool_calls),
+                    "content_chars": len(content),
+                    "dropped_context_msgs": dropped,
+                },
+                project=project,
+            )
 
             if content:
                 payload: dict[str, Any] = {"chars": len(content), "turn": turn}
@@ -421,7 +453,6 @@ def _run_agent_loop(
                     payload["text"] = content
                 append_event("assistant.message", payload, project=project)
 
-            tool_calls = choice.tool_calls or []
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
             if tool_calls:
                 assistant_msg["tool_calls"] = [
@@ -443,7 +474,7 @@ def _run_agent_loop(
                     G.console.print(content)
                 _write_news(project, last_content)
                 _rescue_staged(project, pending)
-                _write_recon_report(project, recon_capture, reason="no-tool-exit")
+                _write_recon_report(project, cfg, recon_capture, reason="no-tool-exit")
                 append_event("agent.ended", {"model": name, "turns": turn}, project=project)
                 return
 
@@ -510,7 +541,7 @@ def _run_agent_loop(
                 else:
                     G.console.print(Panel("Done.", title="⚡ Committed", border_style="green"))
 
-                _write_recon_report(project, recon_capture, reason="committed")
+                _write_recon_report(project, cfg, recon_capture, reason="committed")
                 append_event(
                     "agent.ended", {"model": name, "committed": True, "turns": turn},
                     project=project,
@@ -520,7 +551,7 @@ def _run_agent_loop(
     except KeyboardInterrupt:
         pending.discard()
         G.err.print("\nturn aborted by user; pending changes discarded")
-        _write_recon_report(project, recon_capture, reason="aborted")
+        _write_recon_report(project, cfg, recon_capture, reason="aborted")
         append_event("agent.aborted", {}, project=project)
         append_event("agent.ended", {"model": name, "aborted": True}, project=project)
         return
@@ -528,7 +559,7 @@ def _run_agent_loop(
         G.err.print(f"LLM error: {exc}")
         append_event("error", {"where": "agent_loop", "msg": str(exc)}, project=project)
         pending.discard()
-        _write_recon_report(project, recon_capture, reason="error")
+        _write_recon_report(project, cfg, recon_capture, reason="error")
         append_event("agent.ended", {"model": name, "error": True}, project=project)
         return
 
@@ -544,7 +575,7 @@ def _run_agent_loop(
     )
     _write_news(project, last_content)
     _rescue_staged(project, pending)
-    _write_recon_report(project, recon_capture, reason="max-turns")
+    _write_recon_report(project, cfg, recon_capture, reason="max-turns")
     append_event(
         "agent.ended",
         {"model": name, "turns": G.MAX_AGENT_TURNS, "committed": False},
