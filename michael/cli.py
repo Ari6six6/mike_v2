@@ -96,7 +96,7 @@ _VLLM_MODEL_LABELS: dict[str, str] = {
     "deepseek-ai/DeepSeek-V4-Flash":   "MoE, V4 Flash — 8-bit default, primary target",
     "Qwen/Qwen3-32B-AWQ":              "dense, 4-bit AWQ, ~20 GB VRAM",
     "Qwen/Qwen2.5-72B-Instruct-AWQ":   "dense, 4-bit AWQ, ~40 GB VRAM",
-    "NousResearch/Hermes-4.3-36B":     "36B instruct, native tool-calling, ChatML — ~72 GB VRAM bf16",
+    "NousResearch/Hermes-4.3-36B":     "36B instruct, native tool-calling, ChatML — ~72 GB bf16 / ~36 GB INT8 (bitsandbytes)",
 }
 _VLLM_MODEL_MIN_DISK_GB: dict[str, int] = {
     "deepseek-ai/DeepSeek-V4-Flash":   30,
@@ -1046,6 +1046,32 @@ def _run_gpu_setup_protocol(cfg: "Config", gpu: "GpuConfig", profile_name: str =
         gpu.custom_vllm_models = custom
     else:
         gpu.custom_ollama_models = custom
+
+    # ── Quantization (vLLM only, non-AWQ models) ──
+    # AWQ checkpoints already embed quantization; only prompt for plain bf16 models
+    # where the user may want to reduce VRAM with bitsandbytes INT8 or fp8.
+    if gpu.inference_backend == "vllm" and "awq" not in gpu.model_repo.lower():
+        _quant_options = ["", "bitsandbytes", "fp8", "gptq"]
+        _quant_labels = {
+            "": "auto (bf16/fp16 — full precision, no override)",
+            "bitsandbytes": "INT8 on-the-fly — halves VRAM, works on any Ampere+ GPU",
+            "fp8": "FP8 on-the-fly — ~halves VRAM, Ampere+ only (faster than bnb)",
+            "gptq": "GPTQ (requires a pre-quantized checkpoint on HuggingFace)",
+        }
+        G.console.print("\n[bold]Quantization:[/]")
+        for i, q in enumerate(_quant_options, 1):
+            marker = " [green]← current[/]" if q == (gpu.quantization or "") else ""
+            G.console.print(f"  [cyan]{i}.[/] {q or 'auto'}  [dim]({_quant_labels[q]})[/]{marker}")
+        default_q = str(_quant_options.index(gpu.quantization) + 1) if gpu.quantization in _quant_options else "1"
+        raw_q = typer.prompt("Quantization", default=default_q).strip()
+        try:
+            qi = int(raw_q)
+            if 1 <= qi <= len(_quant_options):
+                gpu.quantization = _quant_options[qi - 1]
+        except ValueError:
+            if raw_q in _quant_options:
+                gpu.quantization = raw_q
+
     cfg.gpu = gpu
     cfg.save()
 
