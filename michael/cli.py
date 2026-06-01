@@ -1735,7 +1735,7 @@ def config_cmd() -> None:
     cmd_config()
 
 
-@gpu_app.callback(invoke_without_command=True)
+@gpu_app.callback()
 def gpu_callback(ctx: typer.Context) -> None:
     """Pick which Vast.ai GPU to use. Shows your instances with hardware names; saves the selection."""
     if ctx.invoked_subcommand is None:
