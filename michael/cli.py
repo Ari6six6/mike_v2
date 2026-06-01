@@ -36,6 +36,7 @@ from michael.backends import (
     _ssh_argv,
     _ssh_preflight,
     _GPU_PY,
+    _gpu_compute_cap,
     _gpu_vllm_overrides,
     _vllm_crash_report,
     _start_ollama_cmd,
@@ -846,7 +847,17 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
     # overrides vLLM won't pick on its own: --dtype half (no bfloat16) and, for
     # AWQ checkpoints, --quantization awq (the auto-selected awq_marlin kernel
     # needs sm80+). Without these the engine dies at init.
-    dtype, quant = _gpu_vllm_overrides(gpu)
+    # Pascal and older (compute < 7.0, e.g. Tesla P40 = 6.1) are not supported
+    # by vLLM v1 at all — its CUDA kernels require Volta (sm70+).
+    _cap = _gpu_compute_cap(gpu)
+    if 0 < _cap < 7.0:
+        raise G.MichaelError(
+            f"GPU compute capability {_cap:.1f} (Pascal or older) is not supported by vLLM v1,\n"
+            f"which requires Volta or newer (sm70 / compute 7.0+).\n\n"
+            f"Rerun `michael gpu up` and select backend 2 (ollama) — it bundles its own\n"
+            f"CUDA runtime and works on older GPUs like the Tesla P40."
+        )
+    dtype, quant = _gpu_vllm_overrides(gpu, _cap)
     if dtype or quant:
         extras = " ".join(
             f"--{k} {v}" for k, v in (("dtype", dtype), ("quantization", quant)) if v
