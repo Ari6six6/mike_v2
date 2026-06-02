@@ -977,20 +977,26 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
             raise G.MichaelError(f"vLLM install failed:\n{(cp.stderr or cp.stdout)[:500]}")
         G.console.print("[green]vLLM installed[/]")
 
-    # ── Ensure curand dev headers (flashinfer JIT-compiles sampling kernels) ──
-    # Some Vast.ai images ship the CUDA runtime but not the curand-dev headers,
-    # causing flashinfer to fail at first use with "fatal error: curand.h: No
-    # such file or directory".  Install libcurand-dev idempotently if missing.
+    # ── Ensure curand dev headers land where nvcc looks (flashinfer JIT) ──
+    # Some Vast.ai images ship the CUDA runtime but not curand-dev.  apt puts
+    # curand.h in /usr/include/ but flashinfer's nvcc invocation only passes
+    # -isystem /usr/local/cuda/include, so the header must live there.
+    # Steps: (1) check the exact path nvcc uses; (2) if missing, apt-install
+    # libcurand-dev; (3) symlink whatever landed under /usr to the CUDA include
+    # dir so nvcc can always find it — idempotent on re-runs.
     cp = _gpu_ssh_run(
         gpu,
-        'find /usr/local/cuda/include /usr/include -name curand.h 2>/dev/null | grep -q . && echo found || echo missing',
+        'test -f /usr/local/cuda/include/curand.h && echo found || echo missing',
         timeout=15,
     )
     if "missing" in cp.stdout:
         G.console.print("[cyan]Installing curand dev headers (needed by flashinfer sampler)…[/]")
         _gpu_ssh_run(
             gpu,
-            'apt-get install -y libcurand-dev 2>/dev/null || true',
+            'apt-get install -y libcurand-dev 2>/dev/null; '
+            'CURAND=$(find /usr -name curand.h 2>/dev/null | head -1); '
+            '[ -n "$CURAND" ] && ln -sf "$CURAND" /usr/local/cuda/include/curand.h 2>/dev/null; '
+            'true',
             timeout=120,
         )
         G.console.print("[green]curand headers installed[/]")
