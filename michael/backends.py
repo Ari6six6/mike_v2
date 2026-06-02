@@ -340,6 +340,7 @@ def _start_vllm_cmd(
     ngpu: int = 1,
     dtype: Optional[str] = None,
     quantization: Optional[str] = None,
+    enforce_eager: bool = False,
 ) -> str:
     """Background vLLM api_server detached from the SSH session, print its PID.
 
@@ -371,6 +372,9 @@ def _start_vllm_cmd(
     max_len_flag = f"--max-model-len {max_len} " if max_len > 0 else ""
     mem_util = getattr(gpu, "gpu_memory_utilization", 0) or 0
     mem_util_flag = f"--gpu-memory-utilization {mem_util} " if mem_util > 0 else ""
+    # --enforce-eager skips CUDA graph capture; used on Blackwell (sm_120f+)
+    # where graph capture crashes silently in the worker process.
+    eager_flag = "--enforce-eager " if enforce_eager else ""
     tool_parser = _vllm_tool_parser(gpu.model_repo)
     # NCCL_DEBUG=WARN surfaces NCCL errors in /tmp/vllm.log (zero cost when healthy).
     # NCCL_P2P_DISABLE/IB_DISABLE force socket transport — required on Vast.ai when
@@ -392,6 +396,7 @@ def _start_vllm_cmd(
         f"{mem_util_flag}"
         f"{dtype_flag}"
         f"{quant_flag}"
+        f"{eager_flag}"
         f">/tmp/vllm.log 2>&1 </dev/null & "
         "echo $!"
     )
