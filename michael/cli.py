@@ -1067,23 +1067,25 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
         )
     dtype, quant = _gpu_vllm_overrides(gpu, _cap)
     # Blackwell (sm_120+, compute cap 12.0+): CUDA graph capture crashes the
-    # worker process silently after torch.compile.  --enforce-eager skips graph
-    # capture and runs in eager mode (slower per-token throughput, but starts).
-    enforce_eager = _cap >= 12.0
+    # worker process silently after torch.compile.  --compilation-config with
+    # cudagraph_mode=none disables ONLY graph capture while keeping torch.compile
+    # (which uses the safe native kernel priority — unlike --enforce-eager, which
+    # switches to vllm_c kernels that also crash silently on Blackwell).
+    compilation_config = '{"cudagraph_mode": "none"}' if _cap >= 12.0 else ""
     if dtype or quant:
         extras = " ".join(
             f"--{k} {v}" for k, v in (("dtype", dtype), ("quantization", quant)) if v
         )
         G.console.print(f"[dim]pre-Ampere GPU — launching with {extras}[/]")
-    if enforce_eager:
-        G.console.print("[dim]Blackwell GPU — launching with --enforce-eager (skips CUDA graph capture)[/]")
+    if compilation_config:
+        G.console.print("[dim]Blackwell GPU — disabling CUDA graph capture (torch.compile on, cudagraph_mode=none)[/]")
     if getattr(gpu, "max_model_len", 0):
         G.console.print(
             f"[dim]context capped at --max-model-len {gpu.max_model_len} "
             f"(raise gpu.max_model_len for longer context on bigger GPUs)[/]"
         )
     _gpu_ssh_run(gpu, _stop_vllm_cmd(), timeout=30)
-    cp = _gpu_ssh_run(gpu, _start_vllm_cmd(gpu, ngpu, dtype, quant, enforce_eager), timeout=60)
+    cp = _gpu_ssh_run(gpu, _start_vllm_cmd(gpu, ngpu, dtype, quant, compilation_config), timeout=60)
     pid = cp.stdout.strip().split("\n")[-1]
     if not pid.isdigit():
         raise G.MichaelError(

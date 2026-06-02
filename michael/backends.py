@@ -301,6 +301,7 @@ def _vllm_crash_report(gpu: GpuConfig) -> str:
       - Pre-EngineCore log section: model-load / CUDA errors that occur before
         the multiprocessing error chain appear here
       - Worker-process error lines if any do make it into the log
+      - EngineCore error lines (the V1 worker subprocess where crashes happen)
       - A hint when nothing is found pointing to max_model_len / utilization
     """
     pattern = (
@@ -321,14 +322,20 @@ def _vllm_crash_report(gpu: GpuConfig) -> str:
         'if [ -n "$FIRST" ] && [ "$FIRST" -gt 1 ]; then '
         "head -$((FIRST - 1)) /tmp/vllm.log 2>/dev/null | tail -50; "
         "else head -50 /tmp/vllm.log 2>/dev/null; fi; "
-        # Worker-process error lines (if the exception did reach the log).
+        # Worker-process error lines (main process / APIServer exceptions).
         "echo '--- worker-process error lines ---'; "
         f"WORKER=$(grep -niE '{pattern}' /tmp/vllm.log 2>/dev/null "
         r"| grep -vE '\(EngineCore pid=|\(APIServer pid='); "
         'if [ -n "$WORKER" ]; then echo "$WORKER" | head -30; '
-        "else echo '(none — vLLM did not write the WorkerProc exception to the "
-        "log; GPU memory above is the best clue. If OOM: lower "
-        "gpu.max_model_len or gpu.gpu_memory_utilization in config.json)'; fi; "
+        "else echo '(none)'; fi; "
+        # EngineCore error lines — the V1 worker subprocess where silent crashes happen.
+        "echo '--- EngineCore error lines ---'; "
+        f"EC_ERRS=$(grep -niE '{pattern}' /tmp/vllm.log 2>/dev/null "
+        r"| grep '\(EngineCore pid='); "
+        'if [ -n "$EC_ERRS" ]; then echo "$EC_ERRS" | head -30; '
+        "else echo '(none — EngineCore crash may be silent IPC; GPU memory above is "
+        "the best clue. If OOM: lower gpu.max_model_len or "
+        "gpu.gpu_memory_utilization in config.json)'; fi; "
         "echo '--- /tmp/vllm.log (last 60 lines) ---'; "
         "tail -60 /tmp/vllm.log 2>&1"
     )
@@ -340,7 +347,7 @@ def _start_vllm_cmd(
     ngpu: int = 1,
     dtype: Optional[str] = None,
     quantization: Optional[str] = None,
-    enforce_eager: bool = False,
+    compilation_config: str = "",
 ) -> str:
     """Background vLLM api_server detached from the SSH session, print its PID.
 
@@ -362,6 +369,13 @@ def _start_vllm_cmd(
     of 0 omits the flag and lets vLLM use the model's full max (rarely viable
     on one GPU). See `_check_enough_kv_cache_memory` in vLLM for the check.
 
+    `compilation_config`, when non-empty, is passed as
+    `--compilation-config '<json>'`. Used on Blackwell (sm_120f+) with
+    `{"cudagraph_mode": "none"}` to disable ONLY CUDA graph capture while
+    keeping torch.compile (which keeps the safe native kernel priority — unlike
+    --enforce-eager, which switches to vllm_c kernels that also crash on
+    Blackwell).
+
     Killing a prior server is intentionally NOT done here — call
     `_stop_vllm_cmd` in a separate SSH session first. See `_stop_vllm_cmd`
     for why the two must never be chained in one shell.
@@ -372,9 +386,7 @@ def _start_vllm_cmd(
     max_len_flag = f"--max-model-len {max_len} " if max_len > 0 else ""
     mem_util = getattr(gpu, "gpu_memory_utilization", 0) or 0
     mem_util_flag = f"--gpu-memory-utilization {mem_util} " if mem_util > 0 else ""
-    # --enforce-eager skips CUDA graph capture; used on Blackwell (sm_120f+)
-    # where graph capture crashes silently in the worker process.
-    eager_flag = "--enforce-eager " if enforce_eager else ""
+    comp_config_flag = f"--compilation-config '{compilation_config}' " if compilation_config else ""
     tool_parser = _vllm_tool_parser(gpu.model_repo)
     # NCCL_DEBUG=WARN surfaces NCCL errors in /tmp/vllm.log (zero cost when healthy).
     # NCCL_P2P_DISABLE/IB_DISABLE force socket transport — required on Vast.ai when
@@ -396,7 +408,7 @@ def _start_vllm_cmd(
         f"{mem_util_flag}"
         f"{dtype_flag}"
         f"{quant_flag}"
-        f"{eager_flag}"
+        f"{comp_config_flag}"
         f">/tmp/vllm.log 2>&1 </dev/null & "
         "echo $!"
     )
