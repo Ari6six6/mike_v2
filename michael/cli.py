@@ -977,29 +977,54 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
             raise G.MichaelError(f"vLLM install failed:\n{(cp.stderr or cp.stdout)[:500]}")
         G.console.print("[green]vLLM installed[/]")
 
-    # ── Drop flashinfer if curand.h is not accessible to nvcc ──────────────
-    # flashinfer's sampling kernels JIT-compile on first use and require
-    # curand.h.  On Vast.ai images where curand-dev is absent the JIT build
-    # crashes and vLLM aborts at startup.  Test with nvcc itself (the same
-    # compiler flashinfer uses) — test -f was unreliable.  If the compile
-    # fails, uninstall flashinfer so vLLM uses its built-in flash-attn
-    # attention + PyTorch sampling fallback (confirmed "FLASH_ATTN backend"
-    # in the startup log, so no attention regression).
+    # ── Reinstall flashinfer if it was previously removed ───────────────────
+    # Earlier attempts uninstalled flashinfer as a workaround; vLLM 0.22+
+    # requires it and crashes the worker process without any log if it's gone.
     cp = _gpu_ssh_run(
         gpu,
-        'printf \'#include <curand.h>\\nint main(){return 0;}\\n\' > /tmp/_curand_test.cu && '
-        '/usr/local/cuda/bin/nvcc /tmp/_curand_test.cu -o /tmp/_curand_test 2>/dev/null && '
-        'echo CURAND_OK || echo CURAND_MISSING',
+        _GPU_PY + '"$PY" -c "import flashinfer" 2>/dev/null && echo installed || echo missing',
         timeout=30,
     )
+    if "missing" in cp.stdout:
+        G.console.print("[cyan]Reinstalling flashinfer (required by vLLM)…[/]")
+        cp = _gpu_ssh_run(gpu, _GPU_PY + '"$PY" -m pip install flashinfer --quiet', timeout=300)
+        G.console.print("[green]flashinfer reinstalled[/]")
+
+    # ── Inject curand.h into flashinfer's own data/include ──────────────────
+    # flashinfer's JIT sampling build passes its own data/include dir to nvcc
+    # via -isystem.  Copying curand.h there is more reliable than fighting
+    # system CUDA package layouts (apt installs it to /usr/include, nvcc only
+    # searches /usr/local/cuda/include).
+    # Source: nvidia-curand-cu12 is installed as a PyTorch dep and provides a
+    # compatible curand.h; fall back to any curand.h found under /usr or /venv.
+    cp = _gpu_ssh_run(
+        gpu,
+        _GPU_PY +
+        'FI_INC=$("$PY" -c "import flashinfer,pathlib; '
+        'print(pathlib.Path(flashinfer.__file__).parent/\'data\'/\'include\')" 2>/dev/null); '
+        '[ -f "$FI_INC/curand.h" ] && echo CURAND_OK || echo CURAND_MISSING',
+        timeout=15,
+    )
     if "CURAND_MISSING" in cp.stdout:
-        G.console.print("[yellow]curand.h not found by nvcc — uninstalling flashinfer (vLLM will use flash-attn + PyTorch sampler)[/]")
-        _gpu_ssh_run(
+        G.console.print("[cyan]Injecting curand.h into flashinfer include path…[/]")
+        result = _gpu_ssh_run(
             gpu,
-            _GPU_PY + '"$PY" -m pip uninstall flashinfer -y 2>/dev/null; true',
+            _GPU_PY +
+            # find curand.h: nvidia pip wheel first (PyTorch dep), then system
+            'CURAND_H=$(find /venv/main/lib -path "*/nvidia/curand/include/curand.h" 2>/dev/null | head -1); '
+            '[ -z "$CURAND_H" ] && CURAND_H=$(find /usr /venv -name curand.h 2>/dev/null | head -1); '
+            # destination: flashinfer data/include (already in nvcc -isystem list)
+            'FI_INC=$("$PY" -c "import flashinfer,pathlib; '
+            'print(pathlib.Path(flashinfer.__file__).parent/\'data\'/\'include\')" 2>/dev/null); '
+            '[ -n "$CURAND_H" ] && [ -d "$FI_INC" ] && cp "$CURAND_H" "$FI_INC/curand.h" && echo CURAND_FIXED; '
+            # clear any failed JIT cache so flashinfer rebuilds fresh
+            'rm -rf /root/.cache/flashinfer/; echo CACHE_CLEARED',
             timeout=60,
         )
-        G.console.print("[green]flashinfer removed — vLLM fallback active[/]")
+        if "CURAND_FIXED" in result.stdout:
+            G.console.print("[green]curand.h injected — flashinfer JIT cache cleared[/]")
+        else:
+            G.console.print("[yellow]Could not inject curand.h — will attempt to start anyway[/]")
 
     # ── Preflight: torch must be able to talk to this GPU's driver ──
     # pip's torch is built for a recent CUDA; on older cards (e.g. Titan RTX)
