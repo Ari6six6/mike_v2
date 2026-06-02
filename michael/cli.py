@@ -977,6 +977,29 @@ def _run_vllm_setup(cfg: "Config", gpu: "GpuConfig", profile_name: str = "") -> 
             raise G.MichaelError(f"vLLM install failed:\n{(cp.stderr or cp.stdout)[:500]}")
         G.console.print("[green]vLLM installed[/]")
 
+    # ── Drop flashinfer if curand.h is not accessible to nvcc ──────────────
+    # flashinfer's sampling kernels JIT-compile on first use and require
+    # curand.h.  On Vast.ai images where curand-dev is absent the JIT build
+    # crashes and vLLM aborts at startup.  Test with nvcc itself (the same
+    # compiler flashinfer uses) — test -f was unreliable.  If the compile
+    # fails, uninstall flashinfer so vLLM uses its built-in flash-attn
+    # attention + PyTorch sampling fallback (confirmed "FLASH_ATTN backend"
+    # in the startup log, so no attention regression).
+    cp = _gpu_ssh_run(
+        gpu,
+        'printf \'#include <curand.h>\\nint main(){return 0;}\\n\' > /tmp/_curand_test.cu && '
+        '/usr/local/cuda/bin/nvcc /tmp/_curand_test.cu -o /tmp/_curand_test 2>/dev/null && '
+        'echo CURAND_OK || echo CURAND_MISSING',
+        timeout=30,
+    )
+    if "CURAND_MISSING" in cp.stdout:
+        G.console.print("[yellow]curand.h not found by nvcc — uninstalling flashinfer (vLLM will use flash-attn + PyTorch sampler)[/]")
+        _gpu_ssh_run(
+            gpu,
+            _GPU_PY + '"$PY" -m pip uninstall flashinfer -y 2>/dev/null; true',
+            timeout=60,
+        )
+        G.console.print("[green]flashinfer removed — vLLM fallback active[/]")
 
     # ── Preflight: torch must be able to talk to this GPU's driver ──
     # pip's torch is built for a recent CUDA; on older cards (e.g. Titan RTX)

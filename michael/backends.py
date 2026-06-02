@@ -375,11 +375,7 @@ def _start_vllm_cmd(
     # NCCL_DEBUG=WARN surfaces NCCL errors in /tmp/vllm.log (zero cost when healthy).
     # NCCL_P2P_DISABLE/IB_DISABLE force socket transport — required on Vast.ai when
     # multiple GPUs are on separate PCIe buses without NVLink or InfiniBand.
-    # VLLM_USE_FLASHINFER_SAMPLER=0 disables flashinfer's JIT-compiled sampling
-    # kernels (which require curand.h, often missing on Vast.ai images) and falls
-    # back to vLLM's built-in PyTorch sampler — functionally identical, negligible
-    # performance difference since sampling is <1 ms vs seconds for attention.
-    nccl_env = "NCCL_DEBUG=WARN VLLM_USE_FLASHINFER_SAMPLER=0 "
+    nccl_env = "NCCL_DEBUG=WARN "
     if getattr(gpu, "nccl_p2p_disable", False):
         nccl_env += "NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 "
     return (
